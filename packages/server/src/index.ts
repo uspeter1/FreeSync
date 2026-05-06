@@ -261,9 +261,9 @@ server.on('upgrade', async (req, socket, head) => {
   const rawUrl = req.url ?? '/';
   const url = new URL(rawUrl, `http://${req.headers.host ?? 'localhost'}`);
 
-  // Expect path: /sync/<vaultId>
+  // Expect path: /sync/<vaultId>/<room>  (room must be in path, not ?room= param)
   const parts = url.pathname.split('/').filter(Boolean);
-  if (parts[0] !== 'sync' || !parts[1]) {
+  if (parts[0] !== 'sync' || !parts[1] || !parts[2]) {
     socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
     socket.destroy();
     return;
@@ -311,13 +311,10 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
   const parts = url.pathname.split('/').filter(Boolean);
   const vaultId = parts[1] ?? 'unknown';
 
-  // setupWSConnection uses the URL path as the doc name by default.
-  // We pass docName = "<vaultId>/<room>" format. The room comes from the
-  // query param ?room=<name> or falls back to the path fragment.
-  const room = url.searchParams.get('room') ?? url.pathname.slice(1); // e.g. "sync/<vaultId>"
-
-  // Build a unique doc name scoped to the vault
-  const docName = `${vaultId}/${room.replace(/^sync\/[^/]+\/?/, '') || '__manifest__'}`;
+  // Build docName from URL path: /sync/<vaultId>/<room...>
+  // parts[2..] is the room (may be multi-segment for sub-folder files)
+  const roomPath = parts.slice(2).join('/');
+  const docName = `${vaultId}/${roomPath}`;
 
   setupWSConnection(ws, req, { docName });
 

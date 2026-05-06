@@ -1,0 +1,10 @@
+{
+  "id": "freesync",
+  "name": "FreeSync",
+  "version": "0.1.0",
+  "minAppVersion": "1.0.0",
+  "description": "Real-time collaborative sync for Obsidian",
+  "author": "FreeSync",
+  "authorUrl": "https://freesync.app",
+  "isDesktopOnly": false
+}
