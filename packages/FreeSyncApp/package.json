@@ -1,0 +1,13 @@
+{
+  "name": "@freesync/app",
+  "version": "0.0.0",
+  "description": "FreeSync mobile app — React Native / Expo vault management and presence",
+  "private": true,
+  "main": "expo-router/entry",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "build:android": "cd android && ANDROID_HOME=/home/peter/android-sdk JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 ./gradlew assembleDebug"
+  }
+}
