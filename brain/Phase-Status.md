@@ -1,9 +1,9 @@
 # Phase Status
 
 ## Current Phase
-**Phase 0 — Bootstrap**
+**Phase 1a — Backend**
 **Status:** Complete
-**Completed by:** Orchestrator
+**Completed by:** Backend Engineer
 **Date:** 2026-05-05
 
 ## Phase History
@@ -11,7 +11,7 @@
 | Phase | Name | Status | Agent | Notes |
 |-------|------|--------|-------|-------|
 | 0 | Bootstrap | ✅ Complete | Orchestrator | Brain vault, monorepo skeleton, GitHub infra |
-| 1a | Backend | 🔲 Not started | Backend Engineer | Supabase schema, relay server |
+| 1a | Backend | ✅ Complete | Backend Engineer | Supabase schema, relay server |
 | 1b | Plugin | 🔲 Not started | Plugin Engineer | Obsidian plugin POC |
 | 2 | Mobile | 🔲 Not started | Mobile Frontend Engineer | Expo app |
 | 3 | Web | 🔲 Not started | Web Frontend Engineer | Next.js dashboard |
@@ -23,14 +23,17 @@
 - GitHub repo created: https://github.com/uspeter1/freesync
 - PR opened: phase/0-bootstrap
 - scripts/test-sync.sh created (not yet run against real sync — no relay yet)
-- No application code exists
+- **Supabase schema applied**: 4 tables (profiles, vaults, vault_members, vault_docs) with RLS and on_auth_user_created trigger
+- **Relay server built** at packages/server/: /health, REST API (/vaults CRUD + join + members), WebSocket /sync/:vaultId?token=<jwt> with y-websocket + JWT auth gate + Yjs persistence
+- `curl http://localhost:3001/health` → `{"status":"ok","ts":"..."}`
+- WebSocket without token → 401
+- `npm run build` exits 0 (clean TypeScript compile)
 
 ## Active Blockers
-None — Backend Engineer can begin Phase 1a immediately.
+None — Plugin Engineer can begin Phase 1b immediately (relay runs on :3001).
 
 ## Next Phase
-**Phase 1a: Backend** — Backend Engineer starts Supabase schema + relay server.
-**Phase 1b: Plugin** — Plugin Engineer can begin after relay is up on :3001.
+**Phase 1b: Plugin** — Plugin Engineer builds the Obsidian plugin. Relay must be running on :3001 with a real Supabase service role key in packages/server/.env.
 
 ## Key Invariants (never violate)
 1. Room names: `${vaultId}/${encodeURIComponent(filePath)}` — must match exactly between relay and plugin
