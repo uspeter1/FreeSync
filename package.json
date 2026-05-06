@@ -1,0 +1,16 @@
+{
+  "name": "freesync",
+  "version": "0.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/server",
+    "packages/plugin",
+    "packages/FreeSyncApp"
+  ],
+  "scripts": {
+    "test:sync": "bash scripts/test-sync.sh"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

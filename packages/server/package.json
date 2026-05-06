@@ -1,0 +1,12 @@
+{
+  "name": "@freesync/server",
+  "version": "0.0.0",
+  "description": "FreeSync relay server — y-websocket relay with Supabase auth and Yjs persistence",
+  "private": true,
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts"
+  }
+}
