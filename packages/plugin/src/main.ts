@@ -607,12 +607,23 @@ class FreeSyncSettingTab extends PluginSettingTab {
   private async renderShareCode(container: HTMLElement) {
     const loading = container.createEl('p', { text: 'Loading invite code…', cls: 'freesync-share-desc' });
     try {
-      const res = await fetch(`${this.plugin.getRelayHttpBase()}/vaults`, {
+      const url = `${this.plugin.getRelayHttpBase()}/vaults`;
+      const res = await fetch(url, {
         headers: { Authorization: `Bearer ${this.plugin.currentJwt}` },
       });
-      const vaults: Array<{ id: string; invite_code: string; name: string }> = await res.json();
+      const json = await res.json();
+      if (!res.ok) {
+        loading.textContent = `Error ${res.status}: ${json?.error ?? 'relay error'}`;
+        console.error('FreeSync share: GET /vaults failed', res.status, json);
+        return;
+      }
+      const vaults: Array<{ id: string; invite_code: string; name: string }> = json;
       const vault = vaults.find(v => v.id === this.plugin.settings.vaultId);
-      if (!vault) { loading.textContent = 'Vault not found.'; return; }
+      if (!vault) {
+        loading.textContent = `Vault not found in your account (ID: ${this.plugin.settings.vaultId.slice(0, 8)}…). Check Vault ID in settings.`;
+        console.error('FreeSync share: vault not in list', this.plugin.settings.vaultId, vaults.map(v => v.id));
+        return;
+      }
       loading.remove();
 
       const shareCode = `${vault.id}/${vault.invite_code}`;
@@ -651,8 +662,9 @@ class FreeSyncSettingTab extends PluginSettingTab {
         );
         window.open(`mailto:${email}?subject=${subject}&body=${body}`);
       });
-    } catch {
-      loading.textContent = 'Failed to load invite code. Make sure sync is enabled.';
+    } catch (e) {
+      loading.textContent = `Failed to reach relay: ${e instanceof Error ? e.message : String(e)}`;
+      console.error('FreeSync share: fetch error', e);
     }
   }
 }
