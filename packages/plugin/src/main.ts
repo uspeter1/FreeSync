@@ -1,4 +1,4 @@
-import { App, Modal, Plugin, PluginSettingTab, Setting, Notice, WorkspaceLeaf, Editor, Menu, MarkdownView } from 'obsidian';
+import { App, Modal, Plugin, PluginSettingTab, Setting, Notice, WorkspaceLeaf, Editor, Menu, MarkdownView, requestUrl } from 'obsidian';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { SyncManager } from './sync';
 import { PresenceManager } from './presence';
@@ -395,16 +395,19 @@ class FreeSyncShareModal extends Modal {
     const loading = contentEl.createEl('p', { text: 'Loading invite code…', cls: 'freesync-share-desc' });
 
     try {
-      const res = await fetch(`${this.relayBase}/vaults`, {
+      const res = await requestUrl({
+        url: `${this.relayBase}/vaults`,
         headers: { Authorization: `Bearer ${this.jwt}` },
+        throw: false,
       });
-      const vaults: Array<{ id: string; invite_code: string; name: string }> = await res.json();
+      if (res.status !== 200) { loading.textContent = `Error ${res.status}: ${res.json?.error ?? 'relay error'}`; return; }
+      const vaults: Array<{ id: string; invite_code: string; name: string }> = res.json;
       const vault = vaults.find(v => v.id === this.vaultId);
       if (!vault) { loading.textContent = 'Vault not found. Make sure you are connected.'; return; }
       loading.remove();
       this.renderContent(vault.name, vault.invite_code);
-    } catch {
-      loading.textContent = 'Failed to load vault info.';
+    } catch (e) {
+      loading.textContent = `Failed to load vault info: ${e instanceof Error ? e.message : String(e)}`;
     }
   }
 
@@ -545,13 +548,15 @@ class FreeSyncSettingTab extends PluginSettingTab {
 
           const token = data.session.access_token;
           const relayBase = this.plugin.getRelayHttpBase();
-          const res = await fetch(`${relayBase}/vaults/${vaultId}/join`, {
+          const res = await requestUrl({
+            url: `${relayBase}/vaults/${vaultId}/join`,
             method: 'POST',
             headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({ invite_code: inviteCode }),
+            throw: false,
           });
-          const json = await res.json();
-          if (!res.ok) {
+          const json = res.json;
+          if (res.status !== 200) {
             new Notice(`Failed to join: ${json.error}`);
             joinBtn.textContent = 'Join Vault';
             (joinBtn as HTMLButtonElement).disabled = false;
@@ -607,17 +612,17 @@ class FreeSyncSettingTab extends PluginSettingTab {
   private async renderShareCode(container: HTMLElement) {
     const loading = container.createEl('p', { text: 'Loading invite code…', cls: 'freesync-share-desc' });
     try {
-      const url = `${this.plugin.getRelayHttpBase()}/vaults`;
-      const res = await fetch(url, {
+      const res = await requestUrl({
+        url: `${this.plugin.getRelayHttpBase()}/vaults`,
         headers: { Authorization: `Bearer ${this.plugin.currentJwt}` },
+        throw: false,
       });
-      const json = await res.json();
-      if (!res.ok) {
-        loading.textContent = `Error ${res.status}: ${json?.error ?? 'relay error'}`;
-        console.error('FreeSync share: GET /vaults failed', res.status, json);
+      if (res.status !== 200) {
+        loading.textContent = `Error ${res.status}: ${res.json?.error ?? 'relay error'}`;
+        console.error('FreeSync share: GET /vaults failed', res.status, res.json);
         return;
       }
-      const vaults: Array<{ id: string; invite_code: string; name: string }> = json;
+      const vaults: Array<{ id: string; invite_code: string; name: string }> = res.json;
       const vault = vaults.find(v => v.id === this.plugin.settings.vaultId);
       if (!vault) {
         loading.textContent = `Vault not found in your account (ID: ${this.plugin.settings.vaultId.slice(0, 8)}…). Check Vault ID in settings.`;

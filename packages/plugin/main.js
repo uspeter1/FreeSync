@@ -32262,10 +32262,16 @@ var FreeSyncShareModal = class extends import_obsidian6.Modal {
     contentEl.createEl("h3", { text: "Share Vault", cls: "freesync-share-title" });
     const loading = contentEl.createEl("p", { text: "Loading invite code\u2026", cls: "freesync-share-desc" });
     try {
-      const res = await fetch(`${this.relayBase}/vaults`, {
-        headers: { Authorization: `Bearer ${this.jwt}` }
+      const res = await (0, import_obsidian6.requestUrl)({
+        url: `${this.relayBase}/vaults`,
+        headers: { Authorization: `Bearer ${this.jwt}` },
+        throw: false
       });
-      const vaults = await res.json();
+      if (res.status !== 200) {
+        loading.textContent = `Error ${res.status}: ${res.json?.error ?? "relay error"}`;
+        return;
+      }
+      const vaults = res.json;
       const vault = vaults.find((v) => v.id === this.vaultId);
       if (!vault) {
         loading.textContent = "Vault not found. Make sure you are connected.";
@@ -32273,8 +32279,8 @@ var FreeSyncShareModal = class extends import_obsidian6.Modal {
       }
       loading.remove();
       this.renderContent(vault.name, vault.invite_code);
-    } catch {
-      loading.textContent = "Failed to load vault info.";
+    } catch (e) {
+      loading.textContent = `Failed to load vault info: ${e instanceof Error ? e.message : String(e)}`;
     }
   }
   renderContent(vaultName, inviteCode) {
@@ -32410,13 +32416,15 @@ var FreeSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           }
           const token = data.session.access_token;
           const relayBase = this.plugin.getRelayHttpBase();
-          const res = await fetch(`${relayBase}/vaults/${vaultId}/join`, {
+          const res = await (0, import_obsidian6.requestUrl)({
+            url: `${relayBase}/vaults/${vaultId}/join`,
             method: "POST",
             headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ invite_code: inviteCode })
+            body: JSON.stringify({ invite_code: inviteCode }),
+            throw: false
           });
-          const json = await res.json();
-          if (!res.ok) {
+          const json = res.json;
+          if (res.status !== 200) {
             new import_obsidian6.Notice(`Failed to join: ${json.error}`);
             joinBtn.textContent = "Join Vault";
             joinBtn.disabled = false;
@@ -32465,17 +32473,17 @@ var FreeSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
   async renderShareCode(container) {
     const loading = container.createEl("p", { text: "Loading invite code\u2026", cls: "freesync-share-desc" });
     try {
-      const url = `${this.plugin.getRelayHttpBase()}/vaults`;
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${this.plugin.currentJwt}` }
+      const res = await (0, import_obsidian6.requestUrl)({
+        url: `${this.plugin.getRelayHttpBase()}/vaults`,
+        headers: { Authorization: `Bearer ${this.plugin.currentJwt}` },
+        throw: false
       });
-      const json = await res.json();
-      if (!res.ok) {
-        loading.textContent = `Error ${res.status}: ${json?.error ?? "relay error"}`;
-        console.error("FreeSync share: GET /vaults failed", res.status, json);
+      if (res.status !== 200) {
+        loading.textContent = `Error ${res.status}: ${res.json?.error ?? "relay error"}`;
+        console.error("FreeSync share: GET /vaults failed", res.status, res.json);
         return;
       }
-      const vaults = json;
+      const vaults = res.json;
       const vault = vaults.find((v) => v.id === this.plugin.settings.vaultId);
       if (!vault) {
         loading.textContent = `Vault not found in your account (ID: ${this.plugin.settings.vaultId.slice(0, 8)}\u2026). Check Vault ID in settings.`;
