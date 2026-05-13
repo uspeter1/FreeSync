@@ -3,8 +3,8 @@
 > See also: [[Architecture]], [[Decisions-Log]], [[Known-Issues]], [[Comments-Plan]]
 
 ## Current Phase
-**P1 Features — Share link + invite by email is next**
-**Status:** All P0 features done. Inline comments, binary sync, last-edited-by, version history (basic), and multi-device presence are complete. Railway relay deployed and live. Next: share link + invite-by-email UI (invite code schema exists).
+**Phase 3 — Web Dashboard (in progress)**
+**Status:** Share link + invite by email complete (plugin UI done, `vaultId/inviteCode` format, context-sensitive settings). Web landing page live at `packages/web/` (Next.js 15, Obsidian shell clone). Auth pages (Sign Up / Sign In) wired to Supabase. Next: account creation confirmation flow, dashboard (vault management), web vault preview.
 **Date updated:** 2026-05-13
 
 ## Phase History
@@ -19,7 +19,7 @@
 | — | Last Edited By + Version History | ✅ Complete | Plugin Engineer | Status bar "Name · Xm ago"; 20-snapshot modal |
 | — | Railway Deployment | ✅ Complete | Plugin Engineer | `wss://freesync-production.up.railway.app`; auto-deploys from branch |
 | 2 | Mobile | 🔲 Not started | Mobile Frontend Engineer | Expo app |
-| 3 | Web | 🔲 Not started | Web Frontend Engineer | Next.js dashboard |
+| 3 | Web | 🚧 In progress | Web Frontend Engineer | Next.js landing + auth live; dashboard TBD |
 | 4 | Production | 🔲 Not started | Backend + Orchestrator | Hetzner, Docker, payments |
 
 ## What Works Right Now
@@ -62,7 +62,8 @@
 | P1 | Version history (basic) | ✅ Done (basic) |
 | P1 | Multi-device presence | ✅ Done (by design) |
 | P1 | Self-hosted relay (Railway) | ✅ Done |
-| **P1** | **Share link + invite by email** | 🔲 **Next** — invite code in schema; needs plugin UI |
+| P1 | Share link + invite by email | ✅ Done — `vaultId/inviteCode` format, context-sensitive settings |
+| **P3** | **Web dashboard** | 🚧 **In progress** — landing page + auth done; vault dashboard next |
 | P1 | Comment notifications | 🔲 Planned |
 | P2 | @mentions in comments | 🔲 Planned |
 | P2 | Suggesting mode (track changes) | 🔲 Planned |

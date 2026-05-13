@@ -22,3 +22,4 @@ ios/Pods/
 *.orig.*
 web-build/
 scripts/dev-reload.py
+packages/web/.next/
