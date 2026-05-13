@@ -154,6 +154,10 @@ export class PresenceManager {
     }
   }
 
+  forceRefresh() {
+    this.renderBadges();
+  }
+
   clearBadges() {
     for (const { inner, badgeContainer } of this.badgeData.values()) {
       inner.style.display = '';

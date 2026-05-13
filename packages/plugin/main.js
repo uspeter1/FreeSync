@@ -30407,6 +30407,10 @@ var SyncManager = class {
       initials,
       activeFile: null
     });
+    this.manifestProvider.on("sync", (isSynced) => {
+      if (isSynced)
+        setTimeout(() => this.presence.forceRefresh(), 150);
+    });
     const fileMap = this.manifestDoc.getMap("files");
     const onFileMapChange = (event) => {
       const renamedFromPaths = /* @__PURE__ */ new Set();
@@ -30945,6 +30949,9 @@ var PresenceManager = class {
       this.badgeData.set(filePath, { navItem, inner, badgeContainer });
       break;
     }
+  }
+  forceRefresh() {
+    this.renderBadges();
   }
   clearBadges() {
     for (const { inner, badgeContainer } of this.badgeData.values()) {
@@ -32434,6 +32441,7 @@ var FreeSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           this.plugin.settings.enabled = true;
           await this.plugin.saveSettings();
           await this.plugin.startSync();
+          joinBtn.textContent = "\u2713 Joined";
           new import_obsidian6.Notice("Joined! Files are syncing to your vault\u2026");
         } catch (e) {
           new import_obsidian6.Notice(`Error: ${e}`);

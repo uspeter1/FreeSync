@@ -567,6 +567,7 @@ class FreeSyncSettingTab extends PluginSettingTab {
           this.plugin.settings.enabled = true;
           await this.plugin.saveSettings();
           await this.plugin.startSync();
+          joinBtn.textContent = '✓ Joined';
           new Notice('Joined! Files are syncing to your vault…');
         } catch (e) {
           new Notice(`Error: ${e}`);

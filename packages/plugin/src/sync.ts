@@ -111,6 +111,13 @@ export class SyncManager {
       activeFile: null,
     });
 
+    // Force badge re-render after the initial awareness sync completes.
+    // The awareness 'change' event only fires for delta changes — if a remote
+    // client's state was already cached locally, no event fires on reconnect.
+    this.manifestProvider.on('sync', (isSynced: boolean) => {
+      if (isSynced) setTimeout(() => this.presence.forceRefresh(), 150);
+    });
+
     const fileMap = this.manifestDoc.getMap<FileEntry>('files');
     const onFileMapChange = (event: Y.YMapEvent<FileEntry>) => {
       const renamedFromPaths = new Set<string>();
