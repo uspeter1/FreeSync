@@ -31985,6 +31985,9 @@ var FreeSyncPlugin = class extends import_obsidian6.Plugin {
       onPositionsUpdate: null
     };
   }
+  get currentJwt() {
+    return this.jwt;
+  }
   async onload() {
     await this.loadSettings();
     this.supabase = createClient(this.settings.supabaseUrl, this.settings.supabaseAnonKey, {
@@ -32341,6 +32344,7 @@ var FreeSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "FreeSync Settings" });
+    const isEmpty2 = this.plugin.app.vault.getFiles().length === 0;
     new import_obsidian6.Setting(containerEl).setName("Email").addText((t) => t.setValue(this.plugin.settings.email).onChange(async (v) => {
       this.plugin.settings.email = v;
       await this.plugin.saveSettings();
@@ -32352,64 +32356,60 @@ var FreeSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
         await this.plugin.saveSettings();
       });
     });
-    new import_obsidian6.Setting(containerEl).setName("Vault ID").setDesc("UUID from FreeSync vault").addText((t) => t.setValue(this.plugin.settings.vaultId).onChange(async (v) => {
-      this.plugin.settings.vaultId = v;
-      await this.plugin.saveSettings();
-    }));
     new import_obsidian6.Setting(containerEl).setName("Relay URL").addText((t) => t.setValue(this.plugin.settings.relayUrl).onChange(async (v) => {
       this.plugin.settings.relayUrl = v;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian6.Setting(containerEl).setName("Enable Sync").addToggle((t) => t.setValue(this.plugin.settings.enabled).onChange(async (v) => {
-      this.plugin.settings.enabled = v;
-      await this.plugin.saveSettings();
-      if (v)
-        await this.plugin.startSync();
-      else
-        await this.plugin.stopSync();
-    }));
-    containerEl.createEl("h3", { text: "Join a Vault", cls: "freesync-settings-section" });
-    containerEl.createEl("p", {
-      text: "Paste an invite code shared by a vault owner to join their vault.",
-      cls: "setting-item-description"
-    });
-    let joinCode = "";
-    new import_obsidian6.Setting(containerEl).setName("Invite code").setDesc("Format: vaultId/inviteCode").addText((t) => t.setPlaceholder("paste invite code here").onChange((v) => {
-      joinCode = v.trim();
-    }));
-    new import_obsidian6.Setting(containerEl).addButton(
-      (btn) => btn.setButtonText("Join Vault").setCta().onClick(async () => {
+    if (isEmpty2) {
+      containerEl.createEl("h3", { text: "Join a Shared Vault", cls: "freesync-settings-section" });
+      containerEl.createEl("p", {
+        text: "Paste an invite code from a vault owner. All their files will sync to your vault automatically.",
+        cls: "setting-item-description"
+      });
+      let joinCode = "";
+      const joinRow = containerEl.createDiv({ cls: "freesync-join-row" });
+      const joinInput = joinRow.createEl("input", { cls: "freesync-share-input" });
+      joinInput.placeholder = "Paste invite code here";
+      joinInput.addEventListener("input", () => {
+        joinCode = joinInput.value.trim();
+      });
+      const joinBtn = joinRow.createEl("button", { text: "Join Vault", cls: "mod-cta freesync-share-btn" });
+      joinBtn.addEventListener("click", async () => {
         if (!joinCode) {
           new import_obsidian6.Notice("Paste an invite code first");
           return;
         }
         const slashIdx = joinCode.indexOf("/");
         if (slashIdx < 1) {
-          new import_obsidian6.Notice("Invalid invite code \u2014 expected vaultId/code");
+          new import_obsidian6.Notice("Invalid invite code \u2014 expected vaultId/inviteCode");
           return;
         }
         const vaultId = joinCode.slice(0, slashIdx);
         const inviteCode = joinCode.slice(slashIdx + 1);
         if (!this.plugin.settings.email || !this.plugin.settings.password) {
-          new import_obsidian6.Notice("Enter your email and password above first");
+          new import_obsidian6.Notice("Enter email and password above first");
           return;
         }
-        const supabase = createClient(
-          this.plugin.settings.supabaseUrl,
-          this.plugin.settings.supabaseAnonKey,
-          { auth: { persistSession: false, autoRefreshToken: false } }
-        );
-        const { data, error } = await supabase.auth.signInWithPassword({
-          email: this.plugin.settings.email,
-          password: this.plugin.settings.password
-        });
-        if (error || !data.session) {
-          new import_obsidian6.Notice(`Sign in failed: ${error?.message}`);
-          return;
-        }
-        const token = data.session.access_token;
-        const relayBase = this.plugin.getRelayHttpBase();
+        joinBtn.textContent = "Joining\u2026";
+        joinBtn.disabled = true;
         try {
+          const supabase = createClient(
+            this.plugin.settings.supabaseUrl,
+            this.plugin.settings.supabaseAnonKey,
+            { auth: { persistSession: false, autoRefreshToken: false } }
+          );
+          const { data, error } = await supabase.auth.signInWithPassword({
+            email: this.plugin.settings.email,
+            password: this.plugin.settings.password
+          });
+          if (error || !data.session) {
+            new import_obsidian6.Notice(`Sign in failed: ${error?.message}`);
+            joinBtn.textContent = "Join Vault";
+            joinBtn.disabled = false;
+            return;
+          }
+          const token = data.session.access_token;
+          const relayBase = this.plugin.getRelayHttpBase();
           const res = await fetch(`${relayBase}/vaults/${vaultId}/join`, {
             method: "POST",
             headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
@@ -32418,16 +32418,105 @@ var FreeSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           const json = await res.json();
           if (!res.ok) {
             new import_obsidian6.Notice(`Failed to join: ${json.error}`);
+            joinBtn.textContent = "Join Vault";
+            joinBtn.disabled = false;
             return;
           }
           this.plugin.settings.vaultId = vaultId;
+          this.plugin.settings.enabled = true;
           await this.plugin.saveSettings();
-          new import_obsidian6.Notice("Joined! Update Vault ID above and re-enable sync to connect.");
-          this.display();
+          await this.plugin.startSync();
+          new import_obsidian6.Notice("Joined! Files are syncing to your vault\u2026");
         } catch (e) {
-          new import_obsidian6.Notice(`Error joining vault: ${e}`);
+          new import_obsidian6.Notice(`Error: ${e}`);
+          joinBtn.textContent = "Join Vault";
+          joinBtn.disabled = false;
         }
-      })
-    );
+      });
+    } else {
+      new import_obsidian6.Setting(containerEl).setName("Vault ID").setDesc("UUID from FreeSync vault").addText((t) => t.setValue(this.plugin.settings.vaultId).onChange(async (v) => {
+        this.plugin.settings.vaultId = v;
+        await this.plugin.saveSettings();
+      }));
+      new import_obsidian6.Setting(containerEl).setName("Enable Sync").addToggle((t) => t.setValue(this.plugin.settings.enabled).onChange(async (v) => {
+        this.plugin.settings.enabled = v;
+        await this.plugin.saveSettings();
+        if (v)
+          await this.plugin.startSync();
+        else
+          await this.plugin.stopSync();
+      }));
+      containerEl.createEl("h3", { text: "Share Vault", cls: "freesync-settings-section" });
+      containerEl.createEl("p", {
+        text: "Share your vault with collaborators. They paste the code in a fresh Obsidian vault.",
+        cls: "setting-item-description"
+      });
+      const shareArea = containerEl.createDiv({ cls: "freesync-share-area" });
+      if (this.plugin.currentJwt) {
+        this.renderShareCode(shareArea);
+      } else {
+        shareArea.createEl("p", {
+          text: "Enable sync above to see your invite code.",
+          cls: "freesync-share-desc"
+        });
+      }
+    }
+  }
+  async renderShareCode(container) {
+    const loading = container.createEl("p", { text: "Loading invite code\u2026", cls: "freesync-share-desc" });
+    try {
+      const res = await fetch(`${this.plugin.getRelayHttpBase()}/vaults`, {
+        headers: { Authorization: `Bearer ${this.plugin.currentJwt}` }
+      });
+      const vaults = await res.json();
+      const vault = vaults.find((v) => v.id === this.plugin.settings.vaultId);
+      if (!vault) {
+        loading.textContent = "Vault not found.";
+        return;
+      }
+      loading.remove();
+      const shareCode = `${vault.id}/${vault.invite_code}`;
+      const codeRow = container.createDiv({ cls: "freesync-share-row" });
+      const codeInput = codeRow.createEl("input", { cls: "freesync-share-input" });
+      codeInput.value = shareCode;
+      codeInput.readOnly = true;
+      codeInput.addEventListener("click", () => codeInput.select());
+      const copyBtn = codeRow.createEl("button", { text: "Copy", cls: "mod-cta freesync-share-btn" });
+      copyBtn.addEventListener("click", () => {
+        navigator.clipboard.writeText(shareCode);
+        copyBtn.textContent = "Copied!";
+        setTimeout(() => {
+          copyBtn.textContent = "Copy";
+        }, 2e3);
+      });
+      const emailRow = container.createDiv({ cls: "freesync-share-row" });
+      emailRow.style.marginTop = "8px";
+      const emailInput = emailRow.createEl("input", { cls: "freesync-share-input", type: "email" });
+      emailInput.placeholder = "colleague@example.com";
+      const emailBtn = emailRow.createEl("button", { text: "Send invite", cls: "freesync-share-btn" });
+      emailBtn.addEventListener("click", () => {
+        const email = emailInput.value.trim();
+        const subject = encodeURIComponent(`Join my vault on FreeSync \u2014 ${vault.name}`);
+        const body = encodeURIComponent(
+          `Hi,
+
+I'd like to collaborate with you on my Obsidian vault using FreeSync.
+
+To join:
+1. Install the FreeSync plugin in Obsidian
+2. Open a fresh, empty vault
+3. Enter your FreeSync credentials in the plugin settings
+4. Paste this invite code when prompted:
+
+   ${shareCode}
+
+Don't have a FreeSync account? Reply and I'll create one for you.
+`
+        );
+        window.open(`mailto:${email}?subject=${subject}&body=${body}`);
+      });
+    } catch {
+      loading.textContent = "Failed to load invite code. Make sure sync is enabled.";
+    }
   }
 };

@@ -545,3 +545,14 @@
   margin-bottom: 4px;
   font-size: 13px;
 }
+
+.freesync-join-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+}
+
+.freesync-share-area {
+  padding-top: 4px;
+}
