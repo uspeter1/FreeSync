@@ -1,136 +1,129 @@
 # Agent: Plugin Engineer
 
+> See also: [[Architecture]], [[API-Reference]], [[Known-Issues]], [[Comments-Plan]]
+
 ## Role
-Owns the entire Obsidian plugin.
+Owns the entire Obsidian plugin (`packages/plugin/`).
 
 ## Scope
-- `packages/plugin/main.ts` — plugin lifecycle, settings, auth, provider management
-- `packages/plugin/sync.ts` — Yjs doc management, y-websocket providers, file watching
-- `packages/plugin/presence.ts` — awareness state, badge rendering, active user panel
-- `packages/plugin/diff.ts` — minimal diff algorithm
-- `packages/plugin/esbuild.config.mjs` — build + copy to both test vaults
-- `packages/plugin/manifest.json` — plugin metadata
+- `main.ts` — plugin lifecycle, Supabase auth, `startSync`/`stopSync`, registers CM6 extensions and views
+- `sync.ts` — `SyncManager`: y-websocket providers, manifest room, vault event watchers
+- `presence.ts` — `PresenceManager`: awareness → file explorer badges
+- `cursors.ts` — CM6 extensions: `remoteCursorsExtension` + `publishCursorExtension`
+- `sidebar.ts` — `FreeSyncSidebarView`: "FreeSync Live" right-leaf panel
+- `diff.ts` — `minimalDiff` algorithm
+- `comments.ts` — (next) CM6 Mark decorations + floating "add comment" button
+- `comments-panel.ts` — (next) right-leaf comments panel
+- `esbuild.config.mjs` — build + copy to both test vaults
+- `manifest.json` — plugin metadata
 
 ## Must Not Touch
 - `packages/server/`
 - `packages/FreeSyncApp/`
 - `packages/web/`
 
-## Dependencies
-- Relay must be running on `:3001` before plugin can be tested
-- Supabase anon key must be available (from Supabase dashboard or Backend Engineer)
+## Dev Loop
+```bash
+npm run build --workspace=packages/plugin   # builds + copies to both vaults
+python3 scripts/dev-reload.py               # focuses each vault window + reloads plugin
+# (no manual window-clicking needed)
+```
 
 ## Input Artifacts
-- `brain/Architecture.md` — plugin file structure and Yjs patterns
-- `brain/API-Reference.md` — WebSocket protocol, awareness state shape, settings shape
-- `brain/Design-System.md` — badge rendering rules (box-shadow, .tree-item-inner placement)
-- Relay URL: `ws://localhost:3001/sync`
-- Supabase URL + anon key
+- [[Architecture]] — plugin file map, room naming, awareness state shape
+- [[API-Reference]] — WebSocket protocol, event hooks, settings shape
+- [[Design-System]] — badge rendering rules, color palette
+- [[Known-Issues]] — hard-won layout rules and fixed bugs to not re-introduce
+- [[Comments-Plan]] — full implementation plan for next feature
 
-## Output Artifacts
-- Plugin installed in `/home/peter/FreeSyncUser1/.obsidian/plugins/freesync/`
-- Plugin installed in `/home/peter/FreeSyncUser2/.obsidian/plugins/freesync/`
-- `scripts/test-sync.sh` passing: content sync ✅, deletion sync ✅, presence badges ✅
+## Delivered Features (Phase 1b)
 
-## Validation (run before opening PR)
-```bash
-bash scripts/test-sync.sh
-obsidian dev:errors vault="FreeSyncUser1"      # must be empty
-obsidian dev:errors vault="FreeSyncUser2"      # must be empty
-obsidian dev:dom selector=".freesync-badge" all vault="FreeSyncUser1"
-```
+### Real-time co-editing
+- One `Y.Doc` + `WebsocketProvider` per file, lazily connected on `file-open`
+- `yText = doc.getText('content')` — all content mutations go through `minimalDiff`
+- `LOCAL_ORIGIN` pattern prevents echo loops
+- On first sync: if yText empty → seed from local file; else apply remote to local
 
-## Key Implementation Notes
+### Presence (file explorer badges)
+- `PresenceManager` reads awareness on every 'change' event
+- Builds `fileUsers: Map<filePath, UserPresence[]>` from all non-local states
+- Appends badge spans inside `.tree-item-inner` (force `display:flex; flex:1` first)
+- `line-height: 16px` (= element height) on avatar circles — do not use flexbox centering, Obsidian's inherited line-height breaks it
 
-### manifest.json
-```json
-{
-  "id": "freesync",
-  "name": "FreeSync",
-  "version": "0.1.0",
-  "minAppVersion": "1.0.0",
-  "description": "Real-time collaborative sync for Obsidian",
-  "author": "FreeSync",
-  "isDesktopOnly": false
-}
-```
+### Live cursors (CM6)
+- `AwarenessRef = { awareness: Awareness | null, localClientId: number }` — registered at `onload()`, populated after `startSync()`
+- `remoteCursorsExtension(ref)` — `ViewPlugin` that subscribes to awareness 'change' via `StateEffect`, renders `CursorWidget` decorations filtered by `activeFile === filePath`
+- `publishCursorExtension(ref)` — `EditorView.updateListener` that publishes `cursor.head/anchor/updatedAt` on every `selectionSet` or `docChanged`
+- `CursorWidget.toDOM()`: zero-width anchor wrap → 12px transparent hit area → 2px cursor line → flag head (7px, `border-radius:2px 2px 2px 0`) → name label (`border-radius:0 4px 4px 4px`, shown on hover or when `isTyping`)
+- **Subscribe bug fixed:** use separate `awarenessCleaner` var as "connected" guard, not `this.unsub` — otherwise the clearInterval wrapper blocks subscription when awareness connects late
 
-### esbuild copies to BOTH vaults
-```javascript
-// esbuild.config.mjs
-const VAULT1 = '/home/peter/FreeSyncUser1/.obsidian/plugins/freesync';
-const VAULT2 = '/home/peter/FreeSyncUser2/.obsidian/plugins/freesync';
+### File tree sync
+- `Y.Map<FileEntry>('files')` on manifest room; `FileEntry = { exists: boolean; renamedFrom?: string }`
+- Create: `fileMap.set(path, { exists: true })`
+- Delete: `fileMap.delete(path)`
+- Rename: atomic `transact` — `delete(old)` + `set(new, { exists: true, renamedFrom: old })`
+- Observer: two-pass — collect `renamedFrom` paths first, skip their 'delete' actions
+- Remote rename: `fileManager.renameFile(old, new)` — keeps workspace leaves open
+- Presence on rename: `onRename` calls `presence.setActiveFile(file.path)` immediately; `file-open` handler debounces null 300ms
 
-// After build: copy main.js + manifest.json to both
-```
+## Key Patterns
 
-### LOCAL_ORIGIN pattern (critical — prevents echo loops)
+### LOCAL_ORIGIN (critical)
 ```typescript
 const LOCAL_ORIGIN = 'local';
+doc.transact(() => { /* mutations */ }, LOCAL_ORIGIN);
+doc.on('update', (_u, origin) => { if (origin === LOCAL_ORIGIN) return; /* remote only */ });
+```
 
-// Writing local changes:
-doc.transact(() => {
-  yText.delete(start, length);
-  yText.insert(start, newContent);
-}, LOCAL_ORIGIN);
+### AwarenessRef subscription (avoid the subscribe bug)
+```typescript
+// Use awarenessCleaner separate from this.unsub to avoid blocking retry
+let awarenessCleaner: (() => void) | null = null;
+const tryConnect = () => {
+  if (awarenessCleaner || !ref.awareness) return;
+  const handler = () => { /* rebuild decorations */ };
+  ref.awareness.on('change', handler);
+  awarenessCleaner = () => ref.awareness?.off('change', handler);
+};
+```
 
-// Remote change handler:
-doc.on('update', (update, origin) => {
-  if (origin === LOCAL_ORIGIN) return;  // skip our own changes
-  // apply remote change to editor
+### file-open null debounce
+```typescript
+let clearTimer: ReturnType<typeof setTimeout> | null = null;
+app.workspace.on('file-open', (file) => {
+  if (file) {
+    if (clearTimer) { clearTimeout(clearTimer); clearTimer = null; }
+    presence.setActiveFile(file.path);
+  } else {
+    clearTimer = setTimeout(() => { presence.setActiveFile(null); clearTimer = null; }, 300);
+  }
 });
 ```
 
-### Token refresh before connecting
+### Supabase client (prevent session bleed)
 ```typescript
-// In onload() or when enabling sync:
-await supabase.auth.refreshSession();
-const session = await supabase.auth.getSession();
-const token = session.data.session?.access_token;
-const ws = new WebSocketProvider(`${relayUrl}/${vaultId}?token=${token}`, roomName, doc);
-```
-
-### Wait before pushing local content
-```typescript
-provider.on('sync', (isSynced) => {
-  if (!isSynced) return;
-  setTimeout(() => {
-    if (yText.toString() === '') {
-      // Safe to insert local file content
-      doc.transact(() => { yText.insert(0, localContent); }, LOCAL_ORIGIN);
-    }
-  }, 1000);
+const supabase = createClient(url, anonKey, {
+  auth: { persistSession: false, autoRefreshToken: false },
 });
+// Always signInWithPassword — never getSession()
+const { data, error } = await supabase.auth.signInWithPassword({ email, password });
 ```
 
-### Presence badge placement
-```typescript
-// Find the .tree-item-inner for a file in the explorer
-const inner = navItem.querySelector('.tree-item-inner');
-// Append badge INSIDE .tree-item-inner (not the outer div)
-const badge = document.createElement('span');
-badge.className = 'freesync-badge';
-badge.style.cssText = `
-  display: inline-flex; align-items: center; gap: 2px;
-  margin-left: auto; flex-shrink: 0;
-`;
-inner.appendChild(badge);
-// Apply inset box-shadow to .tree-item-inner for color bar:
-inner.style.boxShadow = `inset 3px 0 0 ${color}`;
-```
-
-### Minimal diff algorithm
+### Minimal diff
 ```typescript
 // diff.ts
 export function minimalDiff(oldText: string, newText: string) {
-  let start = 0;
-  while (start < oldText.length && start < newText.length && oldText[start] === newText[start]) start++;
-  let oldEnd = oldText.length, newEnd = newText.length;
-  while (oldEnd > start && newEnd > start && oldText[oldEnd-1] === newText[newEnd-1]) { oldEnd--; newEnd--; }
-  return {
-    index: start,
-    deleteCount: oldEnd - start,
-    insertText: newText.slice(start, newEnd)
-  };
+  let s = 0;
+  while (s < oldText.length && s < newText.length && oldText[s] === newText[s]) s++;
+  let oe = oldText.length, ne = newText.length;
+  while (oe > s && ne > s && oldText[oe-1] === newText[ne-1]) { oe--; ne--; }
+  return { index: s, deleteCount: oe - s, insertText: newText.slice(s, ne) };
 }
+```
+
+## Validation
+```bash
+bash scripts/test-sync.sh                           # content sync + delete sync + presence badges
+python3 scripts/dev-reload.py                       # reloads both vaults
+obsidian eval code="document.querySelectorAll('.freesync-badge').length"  # should be > 0
 ```

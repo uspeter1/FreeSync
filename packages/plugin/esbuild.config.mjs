@@ -11,6 +11,7 @@ const copyOutputs = () => {
     if (!existsSync(dest)) mkdirSync(dest, { recursive: true });
     copyFileSync('main.js', join(dest, 'main.js'));
     copyFileSync('manifest.json', join(dest, 'manifest.json'));
+    copyFileSync('styles.css', join(dest, 'styles.css'));
   }
   console.log('Copied to both vaults');
 };

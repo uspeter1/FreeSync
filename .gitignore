@@ -21,3 +21,4 @@ ios/Pods/
 *.mobileprovision
 *.orig.*
 web-build/
+scripts/dev-reload.py
