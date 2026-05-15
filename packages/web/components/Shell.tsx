@@ -259,12 +259,12 @@ export function ObsidianShell({
           })}
         </div>
         <div style={shS.ribbonGroup}>
-          <button style={shS.ribbonBtn} title="Help" onClick={() => scrollTo('sec-welcome')}>
-            <Icon name="help" size={17} />
-          </button>
           <a href="/auth/signin" style={{ ...shS.ribbonBtn, textDecoration: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center' }} title="Sign In">
             <Icon name="users" size={17} color={THEME.accent} />
           </a>
+          <button style={shS.ribbonBtn} title="Settings">
+            <Icon name="settings" size={17} />
+          </button>
         </div>
       </div>
 
@@ -389,7 +389,7 @@ export function ObsidianShell({
         />
       )}
 
-      {/* Status bar */}
+      {/* Status bar — Obsidian style: dark, subtle */}
       <div style={shS.statusBar}>
         <span style={shS.statusVault}>◆ FreeSync</span>
         <div style={shS.statusRight}>
@@ -397,9 +397,9 @@ export function ObsidianShell({
             {(pageMeta?.backlinks?.length || 0)} backlinks
           </span>
           <span style={shS.statusDot}>·</span>
-          <span>✎ 847 words</span>
+          <span>847 words</span>
           <span style={shS.statusDot}>·</span>
-          <a href="/auth/signin" style={{ color: 'rgba(255,255,255,0.85)', textDecoration: 'none' }}>Sign in →</a>
+          <a href="/auth/signin" style={{ color: THEME.textMuted, textDecoration: 'none' }}>Sign in →</a>
         </div>
       </div>
     </div>
@@ -436,9 +436,9 @@ const shS: Record<string, React.CSSProperties> = {
   toolbarTitle: { fontSize: 13, color: THEME.textMuted, marginLeft: 6 },
   iconBtn: { display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'none', border: 'none', cursor: 'pointer', borderRadius: 4, padding: 4, color: THEME.textMuted },
   scroll: { flex: 1, overflowY: 'auto', overflowX: 'hidden' },
-  contentInner: { maxWidth: 720, margin: '0 auto', padding: '44px 52px 96px' },
-  statusBar: { position: 'absolute', bottom: 0, left: 0, right: 0, height: 22, background: THEME.accent, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 12px', fontSize: 11, color: 'rgba(255,255,255,0.85)', zIndex: 20, fontFamily: "'Courier New',monospace" },
-  statusVault: { fontWeight: 700, color: '#fff', letterSpacing: '0.04em' },
+  contentInner: { maxWidth: 720, margin: '0 auto', padding: '44px 52px 60px' },
+  statusBar: { position: 'absolute', bottom: 0, left: 0, right: 0, height: 22, background: '#161616', borderTop: `1px solid ${THEME.border}`, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 12px', fontSize: 11, color: THEME.textMuted, zIndex: 20, fontFamily: "'Courier New',monospace" },
+  statusVault: { fontWeight: 600, color: THEME.textFaint, letterSpacing: '0.04em' },
   statusRight: { display: 'flex', alignItems: 'center', gap: 8 },
-  statusDot: { opacity: 0.45 },
+  statusDot: { opacity: 0.35 },
 };
