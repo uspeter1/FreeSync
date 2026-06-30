@@ -30305,9 +30305,49 @@ function minimalDiff(oldText, newText) {
   };
 }
 
+// src/delete-debounce.ts
+var DeleteDebouncer = class {
+  constructor(opts) {
+    this.opts = opts;
+    this.timers = /* @__PURE__ */ new Map();
+  }
+  schedule(path) {
+    const existing = this.timers.get(path);
+    if (existing)
+      clearTimeout(existing);
+    const handle = setTimeout(() => {
+      this.timers.delete(path);
+      if (this.opts.fileExists(path))
+        return;
+      this.opts.propagate(path);
+    }, this.opts.delayMs);
+    this.timers.set(path, handle);
+  }
+  cancel(path) {
+    const handle = this.timers.get(path);
+    if (!handle)
+      return false;
+    clearTimeout(handle);
+    this.timers.delete(path);
+    return true;
+  }
+  hasPending(path) {
+    return this.timers.has(path);
+  }
+  pendingCount() {
+    return this.timers.size;
+  }
+  cancelAll() {
+    for (const handle of this.timers.values())
+      clearTimeout(handle);
+    this.timers.clear();
+  }
+};
+
 // src/sync.ts
 var LOCAL_ORIGIN = "local";
 var STORAGE_BUCKET = "vault-assets";
+var DELETE_DEBOUNCE_MS = 3e3;
 var BINARY_EXTENSIONS = /* @__PURE__ */ new Set([
   "png",
   "jpg",
@@ -30366,6 +30406,22 @@ var SyncManager = class {
     // storageKeys we just uploaded — prevents re-download loop
     this.recentlyUploaded = /* @__PURE__ */ new Set();
     this.onFileConnected = null;
+    this.deleteDebouncer = new DeleteDebouncer({
+      delayMs: DELETE_DEBOUNCE_MS,
+      fileExists: (path) => this.app.vault.getAbstractFileByPath(path) instanceof import_obsidian.TFile,
+      propagate: (path) => this.propagateDelete(path)
+    });
+  }
+  propagateDelete(path) {
+    if (isBinaryFile(path) && this.settings) {
+      const storageKey = `${this.settings.vaultId}/${path}`;
+      this.settings.supabase.storage.from(STORAGE_BUCKET).remove([storageKey]).catch((err) => console.error("[FreeSync] Storage delete failed:", err));
+    }
+    const fileMap = this.manifestDoc?.getMap("files");
+    this.manifestDoc?.transact(() => {
+      fileMap?.delete(path);
+    }, LOCAL_ORIGIN);
+    this.disconnectFile(path);
   }
   getComments(filePath) {
     return this.commentsMaps.get(filePath) ?? null;
@@ -30426,6 +30482,7 @@ var SyncManager = class {
           const val = fileMap.get(filePath);
           if (!val?.exists)
             return;
+          this.deleteDebouncer.cancel(filePath);
           if (val.lastEditedBy && val.lastEditedAt) {
             this.presence.setFileMetadata(filePath, {
               lastEditedBy: val.lastEditedBy,
@@ -30493,7 +30550,7 @@ var SyncManager = class {
           if (file instanceof import_obsidian.TFile) {
             this.remoteFileOps.add(filePath);
             try {
-              await this.app.vault.delete(file);
+              await this.app.vault.trash(file, true);
             } catch {
             }
             this.remoteFileOps.delete(filePath);
@@ -30703,7 +30760,10 @@ var SyncManager = class {
     const onCreate = async (file) => {
       if (!(file instanceof import_obsidian.TFile))
         return;
+      const hadPending = this.deleteDebouncer.cancel(file.path);
       if (this.remoteFileOps.has(file.path))
+        return;
+      if (hadPending)
         return;
       if (isBinaryFile(file.path)) {
         await this.uploadBinaryFile(file);
@@ -30762,15 +30822,7 @@ var SyncManager = class {
         return;
       if (this.remoteFileOps.has(file.path))
         return;
-      if (isBinaryFile(file.path) && this.settings) {
-        const storageKey = `${this.settings.vaultId}/${file.path}`;
-        this.settings.supabase.storage.from(STORAGE_BUCKET).remove([storageKey]).catch((err) => console.error("[FreeSync] Storage delete failed:", err));
-      }
-      const fileMap = this.manifestDoc?.getMap("files");
-      this.manifestDoc?.transact(() => {
-        fileMap?.delete(file.path);
-      }, LOCAL_ORIGIN);
-      this.disconnectFile(file.path);
+      this.deleteDebouncer.schedule(file.path);
     };
     this.app.vault.on("delete", onDelete);
     this.unsubscribers.push(() => this.app.vault.off("delete", onDelete));
@@ -30803,6 +30855,7 @@ var SyncManager = class {
     for (const unsub of this.unsubscribers)
       unsub();
     this.unsubscribers = [];
+    this.deleteDebouncer.cancelAll();
     this.manifestProvider?.destroy();
     this.manifestDoc?.destroy();
     for (const provider of this.providers.values())

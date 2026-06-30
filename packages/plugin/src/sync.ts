@@ -4,9 +4,17 @@ import { WebsocketProvider } from 'y-websocket';
 import { SupabaseClient } from '@supabase/supabase-js';
 import { PresenceManager } from './presence';
 import { minimalDiff } from './diff';
+import { DeleteDebouncer } from './delete-debounce';
 
 const LOCAL_ORIGIN = 'local';
 const STORAGE_BUCKET = 'vault-assets';
+
+// Cloud-sync engines (OneDrive, Dropbox, iCloud) routinely remove a file from
+// disk for a fraction of a second mid-sync. Obsidian's file watcher reports
+// that as a `delete`, and if we propagate it immediately every peer
+// permanently loses the file. We hold deletes for this window and cancel
+// them if a `create` for the same path arrives.
+const DELETE_DEBOUNCE_MS = 3000;
 
 const BINARY_EXTENSIONS = new Set([
   'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico',
@@ -62,9 +70,30 @@ export class SyncManager {
   private remoteFileOps = new Set<string>();
   // storageKeys we just uploaded — prevents re-download loop
   private recentlyUploaded = new Set<string>();
+  // Per-path debounce coordinator for local deletions (see DELETE_DEBOUNCE_MS)
+  private deleteDebouncer: DeleteDebouncer;
   onFileConnected: ((filePath: string, yComments: Y.Map<Y.Map<any>>) => void) | null = null;
 
-  constructor(private app: App, private presence: PresenceManager) {}
+  constructor(private app: App, private presence: PresenceManager) {
+    this.deleteDebouncer = new DeleteDebouncer({
+      delayMs: DELETE_DEBOUNCE_MS,
+      fileExists: (path) => this.app.vault.getAbstractFileByPath(path) instanceof TFile,
+      propagate: (path) => this.propagateDelete(path),
+    });
+  }
+
+  private propagateDelete(path: string): void {
+    if (isBinaryFile(path) && this.settings) {
+      const storageKey = `${this.settings.vaultId}/${path}`;
+      this.settings.supabase.storage.from(STORAGE_BUCKET).remove([storageKey])
+        .catch(err => console.error('[FreeSync] Storage delete failed:', err));
+    }
+    const fileMap = this.manifestDoc?.getMap<FileEntry>('files');
+    this.manifestDoc?.transact(() => {
+      fileMap?.delete(path);
+    }, LOCAL_ORIGIN);
+    this.disconnectFile(path);
+  }
 
   getComments(filePath: string): Y.Map<Y.Map<any>> | null {
     return this.commentsMaps.get(filePath) ?? null;
@@ -132,6 +161,12 @@ export class SyncManager {
         if (change.action === 'add' || change.action === 'update') {
           const val = fileMap.get(filePath);
           if (!val?.exists) return;
+
+          // A remote peer says this file exists. If we have a pending local
+          // delete for the same path, cancel it — otherwise our 3s timer
+          // would fire and propagate a delete that wipes out the remote's
+          // restoration.
+          this.deleteDebouncer.cancel(filePath);
 
           // Propagate last-edited metadata to status bar
           if (val.lastEditedBy && val.lastEditedAt) {
@@ -201,7 +236,10 @@ export class SyncManager {
           const file = this.app.vault.getAbstractFileByPath(filePath);
           if (file instanceof TFile) {
             this.remoteFileOps.add(filePath);
-            try { await this.app.vault.delete(file); } catch { /* already gone */ }
+            // OS trash (not vault.delete) — a delete reaching us from another
+            // peer may have been a cloud-sync transient on their end. Trash is
+            // recoverable; permanent delete is not.
+            try { await this.app.vault.trash(file, true); } catch { /* already gone */ }
             this.remoteFileOps.delete(filePath);
             this.disconnectFile(filePath);
           }
@@ -412,7 +450,18 @@ export class SyncManager {
 
     const onCreate = async (file: TAbstractFile) => {
       if (!(file instanceof TFile)) return;
+
+      // Cancel any pending delete for this path BEFORE the remoteFileOps
+      // check. The file is back on disk — whether the OS re-created it
+      // (cloud-sync transient), a user restored it, or a remote peer's
+      // create is being applied. Either way, propagating a stale delete
+      // would orphan the file.
+      const hadPending = this.deleteDebouncer.cancel(file.path);
+
       if (this.remoteFileOps.has(file.path)) return;
+      // Local cloud-sync re-create: manifest entry + per-file room are still
+      // intact (we never propagated the delete), so nothing else to do.
+      if (hadPending) return;
 
       if (isBinaryFile(file.path)) {
         await this.uploadBinaryFile(file);
@@ -474,16 +523,9 @@ export class SyncManager {
     const onDelete = (file: TAbstractFile) => {
       if (!(file instanceof TFile)) return;
       if (this.remoteFileOps.has(file.path)) return;
-      if (isBinaryFile(file.path) && this.settings) {
-        const storageKey = `${this.settings.vaultId}/${file.path}`;
-        this.settings.supabase.storage.from(STORAGE_BUCKET).remove([storageKey])
-          .catch(err => console.error('[FreeSync] Storage delete failed:', err));
-      }
-      const fileMap = this.manifestDoc?.getMap<FileEntry>('files');
-      this.manifestDoc?.transact(() => {
-        fileMap?.delete(file.path);
-      }, LOCAL_ORIGIN);
-      this.disconnectFile(file.path);
+      // Debouncer holds the delete for DELETE_DEBOUNCE_MS, re-checks the
+      // file is still gone at fire time, then calls propagateDelete().
+      this.deleteDebouncer.schedule(file.path);
     };
     this.app.vault.on('delete', onDelete);
     this.unsubscribers.push(() => this.app.vault.off('delete', onDelete));
@@ -513,6 +555,7 @@ export class SyncManager {
   stop() {
     for (const unsub of this.unsubscribers) unsub();
     this.unsubscribers = [];
+    this.deleteDebouncer.cancelAll();
     this.manifestProvider?.destroy();
     this.manifestDoc?.destroy();
     for (const provider of this.providers.values()) provider.destroy();

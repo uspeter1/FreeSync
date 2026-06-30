@@ -7,7 +7,7 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 // y-websocket utils (CJS)
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const { setupWSConnection, docs } = require('y-websocket/bin/utils');
+const { setupWSConnection, docs, setPersistence } = require('y-websocket/bin/utils');
 
 // ─── Environment ────────────────────────────────────────────────────────────
 
@@ -56,6 +56,55 @@ async function authenticate(authHeader: string | undefined): Promise<AuthResult 
 const DEBOUNCE_MS = 2000;
 const pendingPersist = new Map<string, ReturnType<typeof setTimeout>>();
 
+function parseDocName(docName: string): { vaultId: string; filePath: string } | null {
+  const slashIdx = docName.indexOf('/');
+  if (slashIdx === -1) return null;
+  return { vaultId: docName.slice(0, slashIdx), filePath: docName.slice(slashIdx + 1) };
+}
+
+// vault_docs.yjs_state is BYTEA; supabase-js JSON-encodes Buffer on write, so
+// stored bytes are `{"type":"Buffer","data":[...]}`. Read returns the BYTEA
+// either as a hex string ("\x..."), a Buffer, or a {type,data} object. Handle
+// every shape, then unwrap the double-encoded JSON if present.
+function decodeYjsState(raw: unknown): Uint8Array | null {
+  if (!raw) return null;
+  let bytes: Buffer | null = null;
+  if (typeof raw === 'string') {
+    bytes = raw.startsWith('\\x')
+      ? Buffer.from(raw.slice(2), 'hex')
+      : Buffer.from(raw, 'base64');
+  } else if (Buffer.isBuffer(raw)) {
+    bytes = raw;
+  } else if (raw instanceof Uint8Array) {
+    bytes = Buffer.from(raw);
+  } else if (typeof raw === 'object' && raw !== null) {
+    const obj = raw as { type?: string; data?: number[] };
+    if (obj.type === 'Buffer' && Array.isArray(obj.data)) bytes = Buffer.from(obj.data);
+  }
+  if (!bytes) return null;
+  try {
+    const wrapped = JSON.parse(bytes.toString('utf8'));
+    if (wrapped?.type === 'Buffer' && Array.isArray(wrapped.data)) {
+      return new Uint8Array(wrapped.data);
+    }
+  } catch { /* not JSON-wrapped — raw bytes */ }
+  return new Uint8Array(bytes);
+}
+
+async function persistNow(vaultId: string, filePath: string, ydoc: Y.Doc): Promise<void> {
+  const stateUpdate = Y.encodeStateAsUpdate(ydoc);
+  const { error } = await supabase.from('vault_docs').upsert(
+    {
+      vault_id: vaultId,
+      file_path: filePath,
+      yjs_state: Buffer.from(stateUpdate),
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: 'vault_id,file_path' }
+  );
+  if (error) console.error(`[persist] Failed to persist "${vaultId}/${filePath}":`, error.message);
+}
+
 function scheduleDocPersist(vaultId: string, docName: string): void {
   const key = `${vaultId}::${docName}`;
   const existing = pendingPersist.get(key);
@@ -65,24 +114,50 @@ function scheduleDocPersist(vaultId: string, docName: string): void {
     pendingPersist.delete(key);
     const doc: Y.Doc | undefined = docs.get(docName);
     if (!doc) return;
-
-    const stateUpdate = Y.encodeStateAsUpdate(doc);
-    const { error } = await supabase.from('vault_docs').upsert(
-      {
-        vault_id: vaultId,
-        file_path: docName.includes('/') ? docName.split('/').slice(1).join('/') : docName,
-        yjs_state: Buffer.from(stateUpdate),
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: 'vault_id,file_path' }
-    );
-    if (error) {
-      console.error(`[persist] Failed to persist doc "${docName}":`, error.message);
-    }
+    const parsed = parseDocName(docName);
+    if (!parsed) return;
+    await persistNow(parsed.vaultId, parsed.filePath, doc);
   }, DEBOUNCE_MS);
 
   pendingPersist.set(key, handle);
 }
+
+// CRITICAL: without bindState, y-websocket creates an empty doc on every
+// connect-when-empty, silently losing any state that was only sync'd to a
+// single client. bindState reads vault_docs and applies it to the fresh doc
+// before the client's sync handshake completes — so a user connecting after
+// everyone else disconnected still sees the persisted manifest + file content.
+setPersistence({
+  bindState: async (docName: string, ydoc: Y.Doc) => {
+    const parsed = parseDocName(docName);
+    if (!parsed) return;
+    try {
+      const { data, error } = await supabase
+        .from('vault_docs')
+        .select('yjs_state')
+        .eq('vault_id', parsed.vaultId)
+        .eq('file_path', parsed.filePath)
+        .maybeSingle();
+      if (!error && data?.yjs_state) {
+        const state = decodeYjsState(data.yjs_state);
+        if (state && state.length > 0) Y.applyUpdate(ydoc, state);
+      }
+    } catch (err) {
+      console.error(`[persist] bindState failed for "${docName}":`, err);
+    }
+    // Persist subsequent updates (debounced). Attached AFTER the initial load
+    // so applying the loaded state doesn't trigger a redundant write.
+    ydoc.on('update', () => scheduleDocPersist(parsed.vaultId, docName));
+  },
+  writeState: async (docName: string, ydoc: Y.Doc) => {
+    const parsed = parseDocName(docName);
+    if (!parsed) return;
+    const key = `${parsed.vaultId}::${docName}`;
+    const existing = pendingPersist.get(key);
+    if (existing) { clearTimeout(existing); pendingPersist.delete(key); }
+    await persistNow(parsed.vaultId, parsed.filePath, ydoc);
+  },
+});
 
 // ─── Express app ────────────────────────────────────────────────────────────
 
@@ -154,15 +229,19 @@ app.post('/vaults/:vaultId/join', async (req: Request, res: Response) => {
 
   if (!invite_code) { res.status(400).json({ error: 'invite_code is required' }); return; }
 
-  // Verify vault + invite code
+  // Verify vault + invite code + open_invite flag
   const { data: vault, error: vaultErr } = await supabase
     .from('vaults')
-    .select('id, invite_code')
+    .select('id, invite_code, open_invite')
     .eq('id', vaultId)
     .single();
 
   if (vaultErr || !vault) { res.status(404).json({ error: 'Vault not found' }); return; }
   if (vault.invite_code !== invite_code) { res.status(403).json({ error: 'Invalid invite code' }); return; }
+  if (!vault.open_invite) {
+    res.status(403).json({ error: 'This vault is not accepting new members via invite code. Ask the owner to add you directly.' });
+    return;
+  }
 
   // Upsert membership (idempotent)
   const { error: memberErr } = await supabase
@@ -172,6 +251,110 @@ app.post('/vaults/:vaultId/join', async (req: Request, res: Response) => {
   if (memberErr) { res.status(500).json({ error: memberErr.message }); return; }
 
   res.json({ joined: true, vault_id: vaultId });
+});
+
+// ── PATCH /vaults/:vaultId/open-invite ───────────────────────────────────────
+app.patch('/vaults/:vaultId/open-invite', async (req: Request, res: Response) => {
+  const auth = await authenticate(req.headers.authorization);
+  if (auth.error) { res.status(401).json({ error: auth.error }); return; }
+  const { userId } = auth;
+
+  const { vaultId } = req.params;
+  const { enabled } = req.body as { enabled?: boolean };
+
+  if (typeof enabled !== 'boolean') { res.status(400).json({ error: 'enabled (boolean) is required' }); return; }
+
+  // Only the vault owner can change this setting
+  const { data: vault } = await supabase
+    .from('vaults')
+    .select('owner_id')
+    .eq('id', vaultId)
+    .single();
+
+  if (!vault || vault.owner_id !== userId) {
+    res.status(403).json({ error: 'Only the vault owner can change this setting' });
+    return;
+  }
+
+  const { error: updateErr } = await supabase
+    .from('vaults')
+    .update({ open_invite: enabled })
+    .eq('id', vaultId);
+
+  if (updateErr) { res.status(500).json({ error: updateErr.message }); return; }
+
+  res.json({ open_invite: enabled });
+});
+
+// ── POST /vaults/:vaultId/invite ─────────────────────────────────────────────
+app.post('/vaults/:vaultId/invite', async (req: Request, res: Response) => {
+  const auth = await authenticate(req.headers.authorization);
+  if (auth.error) { res.status(401).json({ error: auth.error }); return; }
+  const { userId } = auth;
+
+  const { vaultId } = req.params;
+  const { email } = req.body as { email?: string };
+
+  if (!email) { res.status(400).json({ error: 'email is required' }); return; }
+
+  // Verify requester owns this vault
+  const { data: vault } = await supabase
+    .from('vaults')
+    .select('owner_id')
+    .eq('id', vaultId)
+    .single();
+
+  if (!vault || vault.owner_id !== userId) {
+    res.status(403).json({ error: 'Only the vault owner can invite members' });
+    return;
+  }
+
+  // Look up target user by email (service role can read auth.users)
+  const { data: targetUser, error: lookupErr } = await (supabase as any)
+    .schema('auth')
+    .from('users')
+    .select('id')
+    .eq('email', email)
+    .single();
+
+  if (lookupErr || !targetUser) {
+    // No account — store a pending invite, then send a Supabase signup email.
+    // A DB trigger (on_invite_confirmed) will auto-add them to vault_members
+    // when they confirm their account.
+    const { error: pendingErr } = await supabase
+      .from('pending_invites')
+      .upsert({ vault_id: vaultId, email }, { onConflict: 'vault_id,email' });
+
+    if (pendingErr) {
+      res.status(500).json({ error: `Could not store pending invite: ${pendingErr.message}` });
+      return;
+    }
+
+    const { error: inviteErr } = await supabase.auth.admin.inviteUserByEmail(email);
+    if (inviteErr) {
+      // Roll back the pending invite row if the email send failed
+      await supabase.from('pending_invites').delete().eq('vault_id', vaultId).eq('email', email);
+      res.status(500).json({ error: `Could not send invite email: ${inviteErr.message}` });
+      return;
+    }
+
+    res.json({ invited: true, signup_required: true });
+    return;
+  }
+
+  if (targetUser.id === userId) {
+    res.status(400).json({ error: 'You cannot invite yourself' });
+    return;
+  }
+
+  // Add directly to vault_members — no code required
+  const { error: memberErr } = await supabase
+    .from('vault_members')
+    .upsert({ vault_id: vaultId, user_id: targetUser.id, status: 'active' }, { onConflict: 'vault_id,user_id' });
+
+  if (memberErr) { res.status(500).json({ error: memberErr.message }); return; }
+
+  res.json({ invited: true, signup_required: false });
 });
 
 // ── GET /vaults/:vaultId/members ─────────────────────────────────────────────
@@ -317,17 +500,7 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
   const docName = `${vaultId}/${roomPath}`;
 
   setupWSConnection(ws, req, { docName });
-
-  // Hook into the doc for persistence — wait a tick so the doc is registered
-  setImmediate(() => {
-    const doc: Y.Doc | undefined = docs.get(docName);
-    if (!doc) return;
-
-    doc.on('update', (_update: Uint8Array, origin: unknown) => {
-      scheduleDocPersist(vaultId, docName);
-      void origin; // used by y-websocket internally
-    });
-  });
+  // Update handler + persisted-state load are wired in setPersistence's bindState.
 });
 
 // ─── Start ──────────────────────────────────────────────────────────────────
