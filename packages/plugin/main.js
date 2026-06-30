@@ -32338,64 +32338,136 @@ var FreeSyncShareModal = class extends import_obsidian6.Modal {
         return;
       }
       loading.remove();
-      this.renderContent(vault.name, vault.invite_code);
+      this.renderContent(vault.name, vault.invite_code, vault.open_invite ?? false);
     } catch (e) {
       loading.textContent = `Failed to load vault info: ${e instanceof Error ? e.message : String(e)}`;
     }
   }
-  renderContent(vaultName, inviteCode) {
+  renderContent(vaultName, inviteCode, openInvite) {
     const { contentEl } = this;
     const shareCode = `${this.vaultId}/${inviteCode}`;
-    contentEl.createEl("h4", { text: "Anyone with link", cls: "freesync-share-section" });
-    contentEl.createEl("p", {
-      text: 'Share this code with collaborators. They paste it in FreeSync settings \u2192 "Join a Vault".',
-      cls: "freesync-share-desc"
-    });
-    const codeRow = contentEl.createDiv({ cls: "freesync-share-row" });
+    const modeRow = contentEl.createDiv();
+    modeRow.style.cssText = "display:flex;gap:8px;margin-bottom:16px;";
+    const makeTab = (label) => {
+      const btn = modeRow.createEl("button", { text: label });
+      btn.style.cssText = "flex:1;padding:8px 12px;border-radius:6px;border:1px solid var(--background-modifier-border);cursor:pointer;font-size:13px;transition:all 0.12s;";
+      return btn;
+    };
+    const codeTab = makeTab("Anyone with the code");
+    const emailTab = makeTab("Specific people");
+    const codePanel = contentEl.createDiv();
+    const emailPanel = contentEl.createDiv();
+    const activateTab = (mode) => {
+      const isCode = mode === "code";
+      codePanel.style.display = isCode ? "" : "none";
+      emailPanel.style.display = isCode ? "none" : "";
+      codeTab.style.cssText += isCode ? ";background:var(--interactive-accent);color:#fff;border-color:var(--interactive-accent);" : ";background:;color:;border-color:var(--background-modifier-border);";
+      emailTab.style.cssText += isCode ? ";background:;color:;border-color:var(--background-modifier-border);" : ";background:var(--interactive-accent);color:#fff;border-color:var(--interactive-accent);";
+    };
+    codeTab.addEventListener("click", () => activateTab("code"));
+    emailTab.addEventListener("click", () => activateTab("email"));
+    let currentOpenInvite = openInvite;
+    const toggleRow = codePanel.createDiv();
+    toggleRow.style.cssText = "display:flex;align-items:center;gap:10px;margin-bottom:12px;";
+    const toggleLabel = toggleRow.createEl("span");
+    toggleLabel.style.cssText = "flex:1;font-size:13px;";
+    const toggleBtn = toggleRow.createEl("button");
+    toggleBtn.style.cssText = "padding:4px 14px;border-radius:12px;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all 0.12s;";
+    const codeDesc = codePanel.createEl("p", { cls: "freesync-share-desc" });
+    const codeRow = codePanel.createDiv({ cls: "freesync-share-row" });
+    codeRow.style.marginTop = "8px";
     const codeInput = codeRow.createEl("input", { cls: "freesync-share-input" });
     codeInput.value = shareCode;
     codeInput.readOnly = true;
-    codeInput.addEventListener("click", () => codeInput.select());
+    codeInput.addEventListener("click", () => {
+      if (currentOpenInvite)
+        codeInput.select();
+    });
     const copyBtn = codeRow.createEl("button", { text: "Copy", cls: "mod-cta freesync-share-btn" });
+    const toggleStatus = codePanel.createEl("p", { cls: "freesync-share-desc" });
+    toggleStatus.style.marginTop = "6px";
+    const applyOpenInviteState = (enabled) => {
+      currentOpenInvite = enabled;
+      toggleLabel.textContent = enabled ? "Anyone with the code can join" : "Only people you invite can join";
+      toggleBtn.textContent = enabled ? "Enabled" : "Enable code sharing";
+      toggleBtn.style.background = enabled ? "var(--interactive-accent)" : "var(--background-modifier-border)";
+      toggleBtn.style.color = enabled ? "#fff" : "var(--text-muted)";
+      codeDesc.textContent = enabled ? "Anyone who pastes this code in FreeSync can join. You can disable this at any time." : "Code joining is off. Only people you add by email can join.";
+      codeInput.style.opacity = enabled ? "1" : "0.4";
+      copyBtn.disabled = !enabled;
+      copyBtn.style.opacity = enabled ? "1" : "0.4";
+    };
+    applyOpenInviteState(openInvite);
+    toggleBtn.addEventListener("click", async () => {
+      const next = !currentOpenInvite;
+      toggleBtn.disabled = true;
+      toggleStatus.textContent = "";
+      try {
+        const res = await (0, import_obsidian6.requestUrl)({
+          url: `${this.relayBase}/vaults/${this.vaultId}/open-invite`,
+          method: "PATCH",
+          headers: { Authorization: `Bearer ${this.jwt}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: next }),
+          throw: false
+        });
+        if (res.status === 200) {
+          applyOpenInviteState(next);
+        } else {
+          toggleStatus.textContent = `Error: ${res.json?.error ?? "Unknown error"}`;
+        }
+      } catch (e) {
+        toggleStatus.textContent = `Failed: ${e instanceof Error ? e.message : String(e)}`;
+      }
+      toggleBtn.disabled = false;
+    });
     copyBtn.addEventListener("click", () => {
+      if (!currentOpenInvite)
+        return;
       navigator.clipboard.writeText(shareCode);
       copyBtn.textContent = "Copied!";
       setTimeout(() => {
         copyBtn.textContent = "Copy";
       }, 2e3);
     });
-    contentEl.createEl("hr", { cls: "freesync-share-divider" });
-    contentEl.createEl("h4", { text: "Invite by email", cls: "freesync-share-section" });
-    contentEl.createEl("p", {
-      text: "Opens your email client with a pre-filled invite. The recipient must have a FreeSync account.",
+    emailPanel.createEl("p", {
+      text: "Add a collaborator by email. They must already have a FreeSync account. Only people you add can join.",
       cls: "freesync-share-desc"
     });
-    const emailRow = contentEl.createDiv({ cls: "freesync-share-row" });
+    const emailRow = emailPanel.createDiv({ cls: "freesync-share-row" });
+    emailRow.style.marginTop = "10px";
     const emailInput = emailRow.createEl("input", { cls: "freesync-share-input", type: "email" });
     emailInput.placeholder = "colleague@example.com";
-    const sendBtn = emailRow.createEl("button", { text: "Open email", cls: "freesync-share-btn" });
-    sendBtn.addEventListener("click", () => {
+    const addBtn = emailRow.createEl("button", { text: "Add member", cls: "mod-cta freesync-share-btn" });
+    const statusEl = emailPanel.createEl("p", { cls: "freesync-share-desc" });
+    statusEl.style.marginTop = "8px";
+    addBtn.addEventListener("click", async () => {
       const email = emailInput.value.trim();
-      const subject = encodeURIComponent(`Join my vault on FreeSync \u2014 ${vaultName}`);
-      const body = encodeURIComponent(
-        `Hi,
-
-I'd like to collaborate with you on my Obsidian vault using FreeSync (real-time co-editing for Obsidian).
-
-To join:
-1. Install the FreeSync plugin in Obsidian (Community Plugins \u2192 search "FreeSync")
-2. Enter your FreeSync account credentials in the plugin settings
-3. In the "Join a Vault" section, paste this invite code:
-
-   ${shareCode}
-
-Don't have an account? Ask me to create one for you.
-
-See you inside!
-`
-      );
-      window.open(`mailto:${email}?subject=${subject}&body=${body}`);
+      if (!email)
+        return;
+      addBtn.textContent = "Adding\u2026";
+      addBtn.disabled = true;
+      statusEl.textContent = "";
+      try {
+        const res = await (0, import_obsidian6.requestUrl)({
+          url: `${this.relayBase}/vaults/${this.vaultId}/invite`,
+          method: "POST",
+          headers: { Authorization: `Bearer ${this.jwt}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ email }),
+          throw: false
+        });
+        if (res.status === 200) {
+          statusEl.textContent = res.json.signup_required ? `\u2713 Invite sent to ${email}. They'll be automatically added to your vault once they sign up.` : `\u2713 ${email} has been added to your vault.`;
+          emailInput.value = "";
+        } else {
+          statusEl.textContent = `Error: ${res.json?.error ?? "Unknown error"}`;
+        }
+      } catch (e) {
+        statusEl.textContent = `Failed: ${e instanceof Error ? e.message : String(e)}`;
+      }
+      addBtn.textContent = "Add member";
+      addBtn.disabled = false;
     });
+    activateTab("code");
   }
   onClose() {
     this.contentEl.empty();
@@ -32553,45 +32625,133 @@ var FreeSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
       }
       loading.remove();
       const shareCode = `${vault.id}/${vault.invite_code}`;
-      const codeRow = container.createDiv({ cls: "freesync-share-row" });
+      const relayBase = this.plugin.getRelayHttpBase();
+      const vaultId = this.plugin.settings.vaultId;
+      const jwt = this.plugin.currentJwt;
+      const modeRow = container.createDiv();
+      modeRow.style.cssText = "display:flex;gap:8px;margin-bottom:12px;";
+      const makeTab = (label) => {
+        const btn = modeRow.createEl("button", { text: label });
+        btn.style.cssText = "flex:1;padding:6px 10px;border-radius:6px;border:1px solid var(--background-modifier-border);cursor:pointer;font-size:12px;transition:all 0.12s;";
+        return btn;
+      };
+      const codeTab = makeTab("Anyone with the code");
+      const emailTab = makeTab("Specific people");
+      const codePanel = container.createDiv();
+      const emailPanel = container.createDiv();
+      const activateTab = (mode) => {
+        const isCode = mode === "code";
+        codePanel.style.display = isCode ? "" : "none";
+        emailPanel.style.display = isCode ? "none" : "";
+        codeTab.style.background = isCode ? "var(--interactive-accent)" : "";
+        codeTab.style.color = isCode ? "#fff" : "";
+        codeTab.style.borderColor = isCode ? "var(--interactive-accent)" : "var(--background-modifier-border)";
+        emailTab.style.background = isCode ? "" : "var(--interactive-accent)";
+        emailTab.style.color = isCode ? "" : "#fff";
+        emailTab.style.borderColor = isCode ? "var(--background-modifier-border)" : "var(--interactive-accent)";
+      };
+      codeTab.addEventListener("click", () => activateTab("code"));
+      emailTab.addEventListener("click", () => activateTab("email"));
+      let currentOpenInvite = vault.open_invite ?? false;
+      const toggleRow = codePanel.createDiv();
+      toggleRow.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:8px;";
+      const toggleLabel = toggleRow.createEl("span");
+      toggleLabel.style.cssText = "flex:1;font-size:12px;";
+      const toggleBtn = toggleRow.createEl("button");
+      toggleBtn.style.cssText = "padding:3px 12px;border-radius:10px;font-size:11px;font-weight:600;cursor:pointer;border:none;transition:all 0.12s;";
+      const codeDesc = codePanel.createEl("p", { cls: "freesync-share-desc" });
+      const codeRow = codePanel.createDiv({ cls: "freesync-share-row" });
+      codeRow.style.marginTop = "6px";
       const codeInput = codeRow.createEl("input", { cls: "freesync-share-input" });
       codeInput.value = shareCode;
       codeInput.readOnly = true;
-      codeInput.addEventListener("click", () => codeInput.select());
       const copyBtn = codeRow.createEl("button", { text: "Copy", cls: "mod-cta freesync-share-btn" });
+      const toggleStatus = codePanel.createEl("p", { cls: "freesync-share-desc" });
+      toggleStatus.style.marginTop = "4px";
+      const applyOpenInviteState = (enabled) => {
+        currentOpenInvite = enabled;
+        toggleLabel.textContent = enabled ? "Anyone with the code can join" : "Only invited people can join";
+        toggleBtn.textContent = enabled ? "Enabled" : "Enable code sharing";
+        toggleBtn.style.background = enabled ? "var(--interactive-accent)" : "var(--background-modifier-border)";
+        toggleBtn.style.color = enabled ? "#fff" : "var(--text-muted)";
+        codeDesc.textContent = enabled ? "Anyone who pastes this code in FreeSync can join. Disable to prevent new code joins." : 'Code joining is off. Use "Specific people" to add collaborators directly.';
+        codeInput.style.opacity = enabled ? "1" : "0.4";
+        copyBtn.disabled = !enabled;
+        copyBtn.style.opacity = enabled ? "1" : "0.4";
+      };
+      applyOpenInviteState(currentOpenInvite);
+      toggleBtn.addEventListener("click", async () => {
+        const next = !currentOpenInvite;
+        toggleBtn.disabled = true;
+        toggleStatus.textContent = "";
+        try {
+          const r = await (0, import_obsidian6.requestUrl)({
+            url: `${relayBase}/vaults/${vaultId}/open-invite`,
+            method: "PATCH",
+            headers: { Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled: next }),
+            throw: false
+          });
+          if (r.status === 200)
+            applyOpenInviteState(next);
+          else
+            toggleStatus.textContent = `Error: ${r.json?.error ?? "Unknown error"}`;
+        } catch (e) {
+          toggleStatus.textContent = `Failed: ${e instanceof Error ? e.message : String(e)}`;
+        }
+        toggleBtn.disabled = false;
+      });
+      codeInput.addEventListener("click", () => {
+        if (currentOpenInvite)
+          codeInput.select();
+      });
       copyBtn.addEventListener("click", () => {
+        if (!currentOpenInvite)
+          return;
         navigator.clipboard.writeText(shareCode);
         copyBtn.textContent = "Copied!";
         setTimeout(() => {
           copyBtn.textContent = "Copy";
         }, 2e3);
       });
-      const emailRow = container.createDiv({ cls: "freesync-share-row" });
-      emailRow.style.marginTop = "8px";
+      const emailRow = emailPanel.createDiv({ cls: "freesync-share-row" });
       const emailInput = emailRow.createEl("input", { cls: "freesync-share-input", type: "email" });
       emailInput.placeholder = "colleague@example.com";
-      const emailBtn = emailRow.createEl("button", { text: "Send invite", cls: "freesync-share-btn" });
-      emailBtn.addEventListener("click", () => {
+      const addBtn = emailRow.createEl("button", { text: "Add", cls: "mod-cta freesync-share-btn" });
+      const statusEl = emailPanel.createEl("p", { cls: "freesync-share-desc" });
+      statusEl.style.marginTop = "6px";
+      addBtn.addEventListener("click", async () => {
         const email = emailInput.value.trim();
-        const subject = encodeURIComponent(`Join my vault on FreeSync \u2014 ${vault.name}`);
-        const body = encodeURIComponent(
-          `Hi,
-
-I'd like to collaborate with you on my Obsidian vault using FreeSync.
-
-To join:
-1. Install the FreeSync plugin in Obsidian
-2. Open a fresh, empty vault
-3. Enter your FreeSync credentials in the plugin settings
-4. Paste this invite code when prompted:
-
-   ${shareCode}
-
-Don't have a FreeSync account? Reply and I'll create one for you.
-`
-        );
-        window.open(`mailto:${email}?subject=${subject}&body=${body}`);
+        if (!email)
+          return;
+        addBtn.textContent = "Adding\u2026";
+        addBtn.disabled = true;
+        statusEl.textContent = "";
+        try {
+          const r = await (0, import_obsidian6.requestUrl)({
+            url: `${relayBase}/vaults/${vaultId}/invite`,
+            method: "POST",
+            headers: { Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ email }),
+            throw: false
+          });
+          if (r.status === 200) {
+            statusEl.textContent = r.json.signup_required ? `\u2713 Invite sent to ${email}. They'll be automatically added to your vault once they sign up.` : `\u2713 ${email} added to vault.`;
+            emailInput.value = "";
+          } else {
+            statusEl.textContent = `Error: ${r.json?.error ?? "Unknown error"}`;
+          }
+        } catch (e) {
+          statusEl.textContent = `Failed: ${e instanceof Error ? e.message : String(e)}`;
+        }
+        addBtn.textContent = "Add";
+        addBtn.disabled = false;
       });
+      emailPanel.createEl("p", {
+        text: "Only people you add can join. They must already have a FreeSync account.",
+        cls: "freesync-share-desc"
+      }).style.marginTop = "6px";
+      activateTab("code");
     } catch (e) {
       loading.textContent = `Failed to reach relay: ${e instanceof Error ? e.message : String(e)}`;
       console.error("FreeSync share: fetch error", e);
