@@ -55,6 +55,14 @@ async function authenticate(authHeader: string | undefined): Promise<AuthResult 
 
 const DEBOUNCE_MS = 2000;
 const pendingPersist = new Map<string, ReturnType<typeof setTimeout>>();
+const BIND_STATE_ORIGIN = Symbol('freesync-bind-state-load');
+// Tracks docNames whose cascade purge is in-flight or recently completed.
+// Any persistNow call for a docName in this set is a no-op — prevents
+// writeState (fired on the last client's disconnect) from resurrecting a
+// row that the cascade just deleted, when both happen near-simultaneously.
+// Entries are cleared when bindState runs for the same docName (a fresh
+// re-creation of that path is intended to persist normally).
+const purgedDocs = new Set<string>();
 
 function parseDocName(docName: string): { vaultId: string; filePath: string } | null {
   const slashIdx = docName.indexOf('/');
@@ -91,7 +99,71 @@ function decodeYjsState(raw: unknown): Uint8Array | null {
   return new Uint8Array(bytes);
 }
 
+// Resolve whether a file is currently listed in the vault's manifest. Prefers
+// the live in-memory manifest doc (free), falls back to decoding the persisted
+// manifest row. Used to short-circuit per-file bindState so a fresh per-file
+// Y.Doc never gets populated with content for a path the manifest no longer
+// knows about — preventing "ghost restoration" when a new file is created
+// with the same name as a previously-deleted one.
+async function manifestHasFile(vaultId: string, filePath: string): Promise<boolean> {
+  const live: Y.Doc | undefined = docs.get(`${vaultId}/__manifest__`);
+  if (live) return live.getMap('files').has(filePath);
+
+  try {
+    const { data, error } = await supabase
+      .from('vault_docs')
+      .select('yjs_state')
+      .eq('vault_id', vaultId)
+      .eq('file_path', '__manifest__')
+      .maybeSingle();
+    if (error || !data?.yjs_state) return false;
+    const state = decodeYjsState(data.yjs_state);
+    if (!state || state.length === 0) return false;
+    const tmp = new Y.Doc();
+    Y.applyUpdate(tmp, state);
+    const has = tmp.getMap('files').has(filePath);
+    tmp.destroy();
+    return has;
+  } catch (err) {
+    console.error(`[persist] manifestHasFile failed for "${vaultId}/${filePath}":`, err);
+    // On lookup failure, fail open: assume the file exists so we don't
+    // accidentally wipe legitimate content on a transient DB error.
+    return true;
+  }
+}
+
+// Destroy any in-memory Y.Doc for the given path and delete its vault_docs
+// row. Used both by the live cascade (manifest observer) and by the
+// defensive bindState orphan cleanup.
+async function purgePersistedDoc(vaultId: string, filePath: string): Promise<void> {
+  const docName = `${vaultId}/${filePath}`;
+  // Mark synchronously BEFORE any await — any persistNow that runs after
+  // this point (including a writeState in-flight from a near-simultaneous
+  // disconnect) will skip its upsert and let the deletion stand.
+  purgedDocs.add(docName);
+  const live: Y.Doc | undefined = docs.get(docName);
+  if (live) {
+    docs.delete(docName);
+    live.destroy();
+  }
+  // Note: purgedDocs marker is cleared when bindState runs again for the
+  // same docName, so a legitimate re-creation of the path can persist.
+  // Also cancel any pending debounced persist so the destroyed doc's last
+  // state doesn't write back over the deletion.
+  const key = `${vaultId}::${docName}`;
+  const pending = pendingPersist.get(key);
+  if (pending) { clearTimeout(pending); pendingPersist.delete(key); }
+  const { error } = await supabase
+    .from('vault_docs')
+    .delete()
+    .eq('vault_id', vaultId)
+    .eq('file_path', filePath);
+  if (error) console.error(`[persist] purge failed for "${docName}":`, error.message);
+}
+
 async function persistNow(vaultId: string, filePath: string, ydoc: Y.Doc): Promise<void> {
+  const docName = `${vaultId}/${filePath}`;
+  if (purgedDocs.has(docName)) return; // cascade already deleted this row
   const stateUpdate = Y.encodeStateAsUpdate(ydoc);
   const { error } = await supabase.from('vault_docs').upsert(
     {
@@ -131,6 +203,66 @@ setPersistence({
   bindState: async (docName: string, ydoc: Y.Doc) => {
     const parsed = parseDocName(docName);
     if (!parsed) return;
+
+    // A fresh bind for a docName means we want this doc's writes to
+    // persist again, even if the path was previously cascaded.
+    purgedDocs.delete(docName);
+
+    // CRITICAL ORDERING: attach the update handler + manifest observer
+    // BEFORE any async work. y-websocket does NOT await bindState before
+    // serving sync — clients can send updates that fire ydoc events while
+    // our DB load is still in flight. If the handler isn't attached yet,
+    // those updates are silently lost (persist never schedules; cascade
+    // never sees the delete). Both handlers skip BIND_STATE_ORIGIN so the
+    // late-arriving DB load doesn't trigger spurious persists/cascades.
+    ydoc.on('update', (_update: Uint8Array, origin: unknown) => {
+      if (origin === BIND_STATE_ORIGIN) return;
+      scheduleDocPersist(parsed.vaultId, docName);
+    });
+
+    if (parsed.filePath === '__manifest__') {
+      const files = ydoc.getMap<{ exists?: boolean; renamedFrom?: string }>('files');
+      files.observe((event) => {
+        // Ignore the bindState late-load. Loaded state can contain
+        // tombstones for paths that the live doc considers absent;
+        // reconciling them looks like a 'delete' but isn't a user action.
+        if (event.transaction.origin === BIND_STATE_ORIGIN) return;
+
+        // Mirror the plugin's rename-skip pattern: a rename arrives as a
+        // delete of oldPath in the same batch as an add of newPath that
+        // carries renamedFrom = oldPath. Don't cascade the old row's
+        // content away — the new path will reuse it.
+        const renamedFromPaths = new Set<string>();
+        event.changes.keys.forEach((change, key) => {
+          if (change.action === 'add' || change.action === 'update') {
+            const val = files.get(key);
+            if (val?.renamedFrom) renamedFromPaths.add(val.renamedFrom);
+          }
+        });
+        event.changes.keys.forEach((change, key) => {
+          if (change.action !== 'delete') return;
+          if (renamedFromPaths.has(key)) return;
+          void purgePersistedDoc(parsed.vaultId, key);
+        });
+      });
+    }
+
+    // Per-file docs: confirm the file is still in the manifest before
+    // loading state. Catches orphan rows from deletes that propagated
+    // while the relay was restarted (or before this safeguard existed) —
+    // a re-created file with the same name must start empty.
+    //
+    // We deliberately do NOT purge the orphan row here. A naive
+    // fire-and-forget DELETE can race with the next scheduled UPSERT and
+    // wipe legitimate fresh content. The orphan is harmless (never
+    // loaded again) and gets overwritten by the next user write via the
+    // upsert in persistNow. Old orphans can be cleaned by a one-time GC
+    // script; the live cascade observer above keeps new deletes tidy.
+    if (parsed.filePath !== '__manifest__') {
+      const exists = await manifestHasFile(parsed.vaultId, parsed.filePath);
+      if (!exists) return;
+    }
+
     try {
       const { data, error } = await supabase
         .from('vault_docs')
@@ -140,14 +272,11 @@ setPersistence({
         .maybeSingle();
       if (!error && data?.yjs_state) {
         const state = decodeYjsState(data.yjs_state);
-        if (state && state.length > 0) Y.applyUpdate(ydoc, state);
+        if (state && state.length > 0) Y.applyUpdate(ydoc, state, BIND_STATE_ORIGIN);
       }
     } catch (err) {
       console.error(`[persist] bindState failed for "${docName}":`, err);
     }
-    // Persist subsequent updates (debounced). Attached AFTER the initial load
-    // so applying the loaded state doesn't trigger a redundant write.
-    ydoc.on('update', () => scheduleDocPersist(parsed.vaultId, docName));
   },
   writeState: async (docName: string, ydoc: Y.Doc) => {
     const parsed = parseDocName(docName);
