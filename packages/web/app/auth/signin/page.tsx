@@ -30,7 +30,10 @@ export default function SignInPage() {
     const { error: err } = await supabase.auth.signInWithPassword({ email, password });
     setLoading(false);
     if (err) { setError(err.message); return; }
-    window.location.href = '/';
+    // Honour ?returnTo= (set by useRequireSession when it bounces a guarded page)
+    const params = new URLSearchParams(window.location.search);
+    const returnTo = params.get('returnTo');
+    window.location.href = returnTo && returnTo.startsWith('/') ? returnTo : '/dashboard';
   };
 
   return (

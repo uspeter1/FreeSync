@@ -1,6 +1,8 @@
 import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
+import cors from 'cors';
 import http from 'http';
+import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import * as Y from 'yjs';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
@@ -161,6 +163,22 @@ async function purgePersistedDoc(vaultId: string, filePath: string): Promise<voi
   if (error) console.error(`[persist] purge failed for "${docName}":`, error.message);
 }
 
+// Destroy every in-memory Y.Doc belonging to a vault. Used when the vault
+// itself is being deleted — leaving live docs around would let connected
+// clients keep syncing content into a vault that no longer exists.
+function purgeAllVaultDocsInMemory(vaultId: string): void {
+  const prefix = `${vaultId}/`;
+  for (const docName of Array.from(docs.keys() as Iterable<string>)) {
+    if (!docName.startsWith(prefix)) continue;
+    purgedDocs.add(docName);
+    const live: Y.Doc | undefined = docs.get(docName);
+    if (live) { docs.delete(docName); live.destroy(); }
+    const key = `${vaultId}::${docName}`;
+    const pending = pendingPersist.get(key);
+    if (pending) { clearTimeout(pending); pendingPersist.delete(key); }
+  }
+}
+
 async function persistNow(vaultId: string, filePath: string, ydoc: Y.Doc): Promise<void> {
   const docName = `${vaultId}/${filePath}`;
   if (purgedDocs.has(docName)) return; // cascade already deleted this row
@@ -291,6 +309,24 @@ setPersistence({
 // ─── Express app ────────────────────────────────────────────────────────────
 
 const app = express();
+
+// CORS — the Obsidian plugin uses `requestUrl` (native, bypasses browser CORS),
+// but the web dashboard is a real browser and needs preflight support. Allow
+// list is comma-separated via ALLOWED_ORIGINS; localhost:3002 is the default
+// dev origin (see packages/web/package.json "dev" script).
+const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? 'http://localhost:3002')
+  .split(',').map(s => s.trim()).filter(Boolean);
+app.use(cors({
+  origin: (origin, cb) => {
+    // Allow same-origin / curl (no Origin header) and any listed origin.
+    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    cb(new Error(`CORS: origin ${origin} not allowed`));
+  },
+  credentials: false,
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+
 app.use(express.json());
 
 // GET /health
@@ -438,13 +474,19 @@ app.post('/vaults/:vaultId/invite', async (req: Request, res: Response) => {
     return;
   }
 
-  // Look up target user by email (service role can read auth.users)
-  const { data: targetUser, error: lookupErr } = await (supabase as any)
-    .schema('auth')
-    .from('users')
-    .select('id')
-    .eq('email', email)
-    .single();
+  // Look up target user by email via the admin API.
+  //
+  // Historical note: this used to use `.schema('auth').from('users')` but
+  // the `auth` schema isn't exposed to PostgREST by default in Supabase,
+  // so the query always failed and every existing user got treated as
+  // "user doesn't exist" → routed to the pending_invites path. That masked
+  // the real behavior until the dashboard exercised it end-to-end.
+  //
+  // listUsers with in-JS filter is fine at the scale FreeSync targets;
+  // add proper pagination if/when we cross ~1k users per project.
+  const normalized = email.trim().toLowerCase();
+  const { data: userList, error: lookupErr } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const targetUser = userList?.users.find((u) => (u.email ?? '').toLowerCase() === normalized);
 
   if (lookupErr || !targetUser) {
     // No account — store a pending invite, then send a Supabase signup email.
@@ -507,14 +549,31 @@ app.get('/vaults/:vaultId/members', async (req: Request, res: Response) => {
     return;
   }
 
-  const { data, error } = await supabase
+  // Two queries + stitch in code: PostgREST can't embed profiles because
+  // there's no declared FK between vault_members.user_id and profiles.id.
+  // Adding the FK would be a schema change; doing two round-trips is fine
+  // for the small member counts this returns.
+  const { data: memberRows, error: memberErr } = await supabase
     .from('vault_members')
-    .select('user_id, status, joined_at, profiles(display_name, color)')
+    .select('user_id, status, joined_at')
     .eq('vault_id', vaultId)
     .eq('status', 'active');
+  if (memberErr) { res.status(500).json({ error: memberErr.message }); return; }
 
-  if (error) { res.status(500).json({ error: error.message }); return; }
-  res.json(data);
+  const userIds = (memberRows ?? []).map((m) => m.user_id);
+  const { data: profileRows, error: profileErr } = userIds.length > 0
+    ? await supabase.from('profiles').select('id, display_name, color').in('id', userIds)
+    : { data: [] as Array<{ id: string; display_name: string | null; color: string | null }>, error: null };
+  if (profileErr) { res.status(500).json({ error: profileErr.message }); return; }
+
+  const profileMap = new Map((profileRows ?? []).map((p) => [p.id, { display_name: p.display_name, color: p.color }]));
+  const stitched = (memberRows ?? []).map((m) => ({
+    user_id: m.user_id,
+    status: m.status,
+    joined_at: m.joined_at,
+    profiles: profileMap.get(m.user_id) ?? null,
+  }));
+  res.json(stitched);
 });
 
 // ── DELETE /vaults/:vaultId/members/:userId ───────────────────────────────────
@@ -550,6 +609,159 @@ app.delete('/vaults/:vaultId/members/:memberId', async (req: Request, res: Respo
 
   if (error) { res.status(500).json({ error: error.message }); return; }
   res.json({ removed: true });
+});
+
+// ── DELETE /vaults/:vaultId ───────────────────────────────────────────────────
+// Owner-only. Explicit child cleanup (don't rely on FK cascades — makes the
+// dependency list obvious and works even if a table was added without ON
+// DELETE CASCADE). Also destroys any live in-memory Y.Docs so connected
+// clients don't keep syncing into a vault that no longer exists.
+app.delete('/vaults/:vaultId', async (req: Request, res: Response) => {
+  const auth = await authenticate(req.headers.authorization);
+  if (auth.error) { res.status(401).json({ error: auth.error }); return; }
+  const { userId } = auth;
+  const { vaultId } = req.params;
+
+  const { data: vault } = await supabase
+    .from('vaults')
+    .select('owner_id')
+    .eq('id', vaultId)
+    .single();
+  if (!vault) { res.status(404).json({ error: 'Vault not found' }); return; }
+  if (vault.owner_id !== userId) {
+    res.status(403).json({ error: 'Only the vault owner can delete this vault' });
+    return;
+  }
+
+  // Free in-memory state FIRST so any late-arriving persist for this vault
+  // no-ops (see purgedDocs guard in persistNow).
+  purgeAllVaultDocsInMemory(vaultId);
+
+  // Serialize child cleanup so a late failure doesn't leave the vault_docs
+  // and vault_members rows already deleted while the vault row survives.
+  // Tables that don't exist in this project (pending_invites is optional —
+  // its migration may not have been applied) are treated as no-ops instead
+  // of blocking the delete.
+  const childTables = ['vault_docs', 'vault_members', 'pending_invites'];
+  for (const table of childTables) {
+    const { error } = await supabase.from(table).delete().eq('vault_id', vaultId);
+    if (error) {
+      const msg = error.message.toLowerCase();
+      const missingTable = msg.includes('could not find the table') || msg.includes('does not exist');
+      if (missingTable) continue;
+      res.status(500).json({ error: `Failed to clean up ${table}: ${error.message}` });
+      return;
+    }
+  }
+
+  const { error: vaultErr } = await supabase.from('vaults').delete().eq('id', vaultId);
+  if (vaultErr) { res.status(500).json({ error: vaultErr.message }); return; }
+
+  res.json({ deleted: true });
+});
+
+// ── POST /vaults/:vaultId/leave ──────────────────────────────────────────────
+// Any active member (except the owner) can remove themselves. Owners must
+// either delete the vault or (eventually) transfer ownership. POST rather
+// than DELETE to leave room for future side effects (email notification)
+// and to mirror POST /join's shape.
+app.post('/vaults/:vaultId/leave', async (req: Request, res: Response) => {
+  const auth = await authenticate(req.headers.authorization);
+  if (auth.error) { res.status(401).json({ error: auth.error }); return; }
+  const { userId } = auth;
+  const { vaultId } = req.params;
+
+  const { data: vault } = await supabase
+    .from('vaults')
+    .select('owner_id')
+    .eq('id', vaultId)
+    .single();
+  if (!vault) { res.status(404).json({ error: 'Vault not found' }); return; }
+  if (vault.owner_id === userId) {
+    res.status(400).json({ error: 'Owners cannot leave their own vault. Delete it or transfer ownership.' });
+    return;
+  }
+
+  const { data: member } = await supabase
+    .from('vault_members')
+    .select('status')
+    .eq('vault_id', vaultId)
+    .eq('user_id', userId)
+    .single();
+  if (!member) { res.status(403).json({ error: 'You are not a member of this vault' }); return; }
+
+  const { error } = await supabase
+    .from('vault_members')
+    .delete()
+    .eq('vault_id', vaultId)
+    .eq('user_id', userId);
+  if (error) { res.status(500).json({ error: error.message }); return; }
+
+  res.json({ left: true });
+});
+
+// ── PATCH /vaults/:vaultId ───────────────────────────────────────────────────
+// Rename. Owner-only. Only name is editable for now.
+app.patch('/vaults/:vaultId', async (req: Request, res: Response) => {
+  const auth = await authenticate(req.headers.authorization);
+  if (auth.error) { res.status(401).json({ error: auth.error }); return; }
+  const { userId } = auth;
+  const { vaultId } = req.params;
+  const { name } = req.body as { name?: string };
+  if (!name?.trim()) { res.status(400).json({ error: 'name is required' }); return; }
+
+  const { data: vault } = await supabase
+    .from('vaults')
+    .select('owner_id')
+    .eq('id', vaultId)
+    .single();
+  if (!vault) { res.status(404).json({ error: 'Vault not found' }); return; }
+  if (vault.owner_id !== userId) {
+    res.status(403).json({ error: 'Only the vault owner can rename this vault' });
+    return;
+  }
+
+  const { data, error } = await supabase
+    .from('vaults')
+    .update({ name: name.trim() })
+    .eq('id', vaultId)
+    .select()
+    .single();
+  if (error) { res.status(500).json({ error: error.message }); return; }
+  res.json(data);
+});
+
+// ── POST /vaults/:vaultId/rotate-invite-code ─────────────────────────────────
+// Owner-only. Generates a new invite_code — old codes stop working
+// immediately on POST /join. Use this after a code is shared to someone
+// who shouldn't have it.
+app.post('/vaults/:vaultId/rotate-invite-code', async (req: Request, res: Response) => {
+  const auth = await authenticate(req.headers.authorization);
+  if (auth.error) { res.status(401).json({ error: auth.error }); return; }
+  const { userId } = auth;
+  const { vaultId } = req.params;
+
+  const { data: vault } = await supabase
+    .from('vaults')
+    .select('owner_id')
+    .eq('id', vaultId)
+    .single();
+  if (!vault) { res.status(404).json({ error: 'Vault not found' }); return; }
+  if (vault.owner_id !== userId) {
+    res.status(403).json({ error: 'Only the vault owner can rotate the invite code' });
+    return;
+  }
+
+  // 8 bytes → 11-char base64url. 64 bits of entropy, human-shareable length.
+  const newCode = crypto.randomBytes(8).toString('base64url');
+  const { data, error } = await supabase
+    .from('vaults')
+    .update({ invite_code: newCode })
+    .eq('id', vaultId)
+    .select('invite_code')
+    .single();
+  if (error) { res.status(500).json({ error: error.message }); return; }
+  res.json({ invite_code: data.invite_code });
 });
 
 // ── 404 handler ───────────────────────────────────────────────────────────────

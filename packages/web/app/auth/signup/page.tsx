@@ -43,7 +43,7 @@ export default function SignUpPage() {
     if (data.user && !data.session) {
       setSuccess(true);
     } else {
-      window.location.href = '/';
+      window.location.href = '/dashboard';
     }
   };
 
