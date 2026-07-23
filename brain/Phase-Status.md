@@ -4,8 +4,10 @@
 
 ## Current Phase
 **Phase 3 — Web Dashboard (in progress)**
-**Status:** Share link + invite by email complete (plugin UI done, `vaultId/inviteCode` format, context-sensitive settings). Web landing page live at `packages/web/` (Next.js 15, Obsidian shell clone). Auth pages (Sign Up / Sign In) wired to Supabase. Next: account creation confirmation flow, dashboard (vault management), web vault preview.
-**Date updated:** 2026-05-13
+**Status:** Share link + invite by email complete (plugin UI done, `vaultId/inviteCode` format, context-sensitive settings). Web landing page live at `packages/web/` (Next.js 15, Obsidian shell clone). Auth pages (Sign Up / Sign In) wired to Supabase. Three data-safety fixes landed 2026-07-22 in response to a real file-loss incident (see [[Known-Issues]] for details). Next: account creation confirmation flow, dashboard (vault management), web vault preview.
+**Date updated:** 2026-07-22
+
+**⚠ Prod relay:** `wss://freesync-production.up.railway.app` returned 404 "Application not found" on 2026-07-22 — the Railway app appears removed/renamed. Verify before assuming prod URL still works.
 
 ## Phase History
 
@@ -63,6 +65,7 @@
 | P1 | Multi-device presence | ✅ Done (by design) |
 | P1 | Self-hosted relay (Railway) | ✅ Done |
 | P1 | Share link + invite by email | ✅ Done — `vaultId/inviteCode` format, context-sensitive settings |
+| P0 | Data-loss safety net (bindState + trash + delete debouncer + ghost-restore cascade) | ✅ Done 2026-07-22 (commits b2597d0, 9f0a259) |
 | **P3** | **Web dashboard** | 🚧 **In progress** — landing page + auth done; vault dashboard next |
 | P1 | Comment notifications | 🔲 Planned |
 | P2 | @mentions in comments | 🔲 Planned |

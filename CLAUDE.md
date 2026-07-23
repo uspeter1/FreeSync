@@ -77,6 +77,33 @@ python3 scripts/dev-reload.py
 - `/home/peter/FreeSyncUser2` — `user2@freesync.test`
 - Shared vaultId: `e49ed7f7-6c8a-4329-b8e9-1bfaea4be449`
 
+**Creating fresh test accounts (Gmail plus-alias trick):**
+
+Gmail (and most modern mail providers) ignore everything between `+` and `@` for delivery — `appdev+anything@mattjones.org` all land in the `appdev@mattjones.org` inbox, but Supabase treats them as distinct accounts. Use this to spin up throwaway test users without registering new mailboxes:
+
+```
+appdev+freesync-alice@mattjones.org
+appdev+freesync-bob@mattjones.org
+appdev+freesync-<whatever>@mattjones.org
+```
+
+**Bypass the email confirmation step** with Supabase's admin API (needs `SUPABASE_SERVICE_ROLE_KEY`, already in `packages/server/.env`) — the confirmation email would land in Peter's real inbox otherwise:
+
+```bash
+SR=<service role key>
+# Create pre-confirmed account (no email at all):
+curl -s -X POST "https://awgcorggtvfcnmjdcljb.supabase.co/auth/v1/admin/users" \
+  -H "apikey: $SR" -H "Authorization: Bearer $SR" -H "Content-Type: application/json" \
+  -d '{"email":"appdev+freesync-X@mattjones.org","password":"testpass123","email_confirm":true,"user_metadata":{"display_name":"X"}}'
+
+# Or confirm an already-created account:
+curl -s -X PUT "https://awgcorggtvfcnmjdcljb.supabase.co/auth/v1/admin/users/<user-id>" \
+  -H "apikey: $SR" -H "Authorization: Bearer $SR" -H "Content-Type: application/json" \
+  -d '{"email_confirm":true}'
+```
+
+Sign-in works with the full plus-alias email + password. Don't hammer the public `/auth/v1/signup` endpoint — it has a per-domain email-send rate limit; the admin path skips email entirely.
+
 **Gotcha:** `obsidian eval --vault <name>` targets whichever window has focus, not the named vault. Always use `scripts/dev-reload.py` which focuses the correct window first.
 
 ---

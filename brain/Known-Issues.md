@@ -30,6 +30,16 @@ Status values: `[OPEN]` `[IN PROGRESS]` `[FIXED]` `[DEFERRED]` `[WONTFIX]`
 
 - `[KNOWN]` **Comments panel not auto-opened** — the panel is an ItemView that must be opened manually via the ribbon icon (message-square). There is no auto-open when a file with comments is opened. Future: auto-reveal when file has comments.
 
+- `[FIXED]` **Relay was write-only against `vault_docs`** — the persistence handler wrote every Yjs update to Supabase but never loaded state back. After a relay restart (Railway redeploy) with no clients connected, the next client to join got an empty `Y.Doc`; that empty CRDT state could then merge into peers and surface as missing files or content reverting to an older version. Root cause of a real school-file loss incident. Fixed 2026-07-22 (commit b2597d0): added `setPersistence({ bindState, writeState })` so the relay loads `vault_docs` into fresh `Y.Doc`s before the sync handshake. `decodeYjsState()` handles the historical double-JSON-encoded BYTEA storage shape. **Never remove `bindState`.**
+
+- `[FIXED]` **`vault.delete` on receiver = permanent unlink** — the manifest observer's delete branch called `this.app.vault.delete(file)`, which is Obsidian's permanent unlink (no trash). A single spurious remote delete was unrecoverable. Fixed 2026-07-22 (commit b2597d0): switched to `this.app.vault.trash(file, true)` in `packages/plugin/src/sync.ts`. **Never revert to `vault.delete()` on the receive path** — even if every other safeguard fails, `trash()` keeps deletions recoverable from OS trash.
+
+- `[FIXED]` **OneDrive/Dropbox/iCloud transient triggered permanent delete** — cloud-sync engines routinely blip a file off disk for a fraction of a second mid-sync. Obsidian's watcher reported this as `delete`, which propagated to every peer in milliseconds. Fixed 2026-07-22 (commit b2597d0): `DeleteDebouncer` in `packages/plugin/src/delete-debounce.ts` holds deletes for 3s; `onCreate` cancels the pending delete when the file reappears; the manifest observer also cancels when a remote peer says the file exists; a fire-time `fileExists()` re-check aborts propagation defensively. 12/12 unit tests in `delete-debounce.test.ts` (run with `npx tsx --test packages/plugin/src/delete-debounce.test.ts`).
+
+- `[FIXED]` **Ghost-restoration of deleted files** — `vault_docs` was keyed on `(vault_id, file_path)` and deletes propagated only via the manifest; the per-file row was never purged. A later create with the same path (e.g. two "Untitled.md" in a row) re-loaded the orphan content into the new `Y.Doc` via `bindState`. Fixed 2026-07-22 (commit 9f0a259): live cascade observer on `__manifest__`'s `files` Y.Map destroys the in-memory per-file `Y.Doc` and deletes the row on real deletes (skipping renames via the same `renamedFrom` pattern the plugin uses). Defensive per-file `bindState` consults `manifestHasFile(vaultId, filePath)` before loading — catches orphans from before this fix. `BIND_STATE_ORIGIN` symbol tags the late-arriving DB load so the manifest observer doesn't fire phantom cascades from CRDT reconciliation. `purgedDocs` set (marked synchronously before any await) prevents a near-simultaneous `writeState` from resurrecting a just-deleted row. All three guards are load-bearing; end-to-end test in `scripts/repro-ghost-restore.mjs` (8/8 assertions).
+
+- `[KNOWN]` **y-websocket does not await `bindState`** — clients can send updates while the DB load is in flight. **Every handler (`ydoc.on('update')`, `files.observe()`) must be attached BEFORE any `await` in `bindState`** or the first user write is silently dropped. The bindState load is tagged with `BIND_STATE_ORIGIN` so those handlers can ignore CRDT reconciliation events without ignoring real user changes. Discovered 2026-07-22 while writing the ghost-restore repro (the first draft attached handlers after the manifest lookup and lost the initial write in every run).
+
 ---
 
 ## Architectural Debt
@@ -42,6 +52,9 @@ Status values: `[OPEN]` `[IN PROGRESS]` `[FIXED]` `[DEFERRED]` `[WONTFIX]`
 - `[DEFERRED]` @mentions — P1 feature, after comments
 - `[DEFERRED]` Version history / snapshots — P2 feature, after comments
 - `[DEFERRED]` Share link + invite by email — P1, requires email infra
+- `[DEFERRED]` **File history / recoverable deletions** — the ghost-restore fix intentionally purges deleted content rather than preserving it. A separate feature could add a `vault_doc_versions` table + `INSERT ... SELECT` before each cascade-delete, plus a restoration UX. Discussed 2026-07-22, not yet planned.
+- `[DEFERRED]` **Vault_docs orphan-row GC** — the defensive `bindState` path deliberately does NOT clean orphan rows (a fire-and-forget DELETE races with the next upsert and can wipe fresh content). Orphans are harmless (never loaded again) but accumulate as table bloat over time. A one-time GC script could scan `vault_docs` and delete rows whose `file_path` is not in the corresponding `__manifest__` doc's `files` map. Not urgent — no functional impact.
+- `[OPEN]` **Prod relay URL 404** — `https://freesync-production.up.railway.app/health` returned `404 Application not found` on 2026-07-22. The Railway app appears removed or renamed. Prod may have moved or been retired. Verify current URL before assuming prod deploy target.
 
 ---
 

@@ -210,3 +210,59 @@ Record every significant architectural or product decision here. Include: what w
 3. `cursors.ts` subscribe guard: use `awarenessCleaner` variable, not `this.unsub`
 4. `awarenessRef` wired in `startSync()` after `syncManager.start()`, cleared in `stopSync()`
 5. Never call `getBoundingClientRect()` inside CM6 `update()` — forces synchronous reflow
+
+---
+
+## 2026-07-22 — Relay must load persisted state on doc creation (bindState)
+
+**Decision:** The relay's y-websocket persistence layer uses `setPersistence({ bindState, writeState })` from `y-websocket/bin/utils`. `bindState` reads the corresponding `vault_docs` row and applies it to the fresh `Y.Doc` before the client's sync handshake completes.
+
+**Why:** The prior implementation was write-only — every update was persisted, but nothing was ever loaded back. When the relay restarted (Railway redeploy) with no clients connected, the next client to join got an empty `Y.Doc`. That empty CRDT state then merged into other peers, surfacing as missing files or reverted content. This directly caused real user data loss (school files) in July 2026.
+
+**Never remove `bindState`.** The persistence path is: `bindState` loads on doc creation → live updates trigger debounced `persistNow` → `writeState` flushes on last-client disconnect. Removing any layer reintroduces the loss.
+
+**Related mechanics that are also load-bearing:**
+- `decodeYjsState()` handles three historical BYTEA shapes (hex string, Buffer, Buffer-JSON-wrapped). Old rows use JSON-wrapped bytes because supabase-js encoded `Buffer` as JSON on write. New writes use raw bytes.
+- Handlers (`ydoc.on('update')`, `files.observe()`) must be attached BEFORE any `await` in `bindState` — y-websocket does not await the load, and updates arriving during the async gap are silently dropped otherwise. See [[Known-Issues]] entry on this.
+
+---
+
+## 2026-07-22 — Receiver-side deletes use `vault.trash`, never `vault.delete`
+
+**Decision:** The plugin's manifest observer, on a remote delete, calls `this.app.vault.trash(file, true)` — Obsidian's OS-trash path. Never `vault.delete()` (permanent unlink).
+
+**Why:** A single spurious delete arriving from a peer is unrecoverable if it hits `unlink()`. Any bug — in the cascade observer, in the delete debouncer, in a cloud-sync integration — that causes a phantom delete would destroy user files across every device it propagates to. Trash is the last-resort safety net that stays functional even when every other defense fails. Recoverable from Windows Recycle Bin / macOS Trash.
+
+**Never revert.** This is a one-line change that costs nothing in the happy path and protects everything.
+
+---
+
+## 2026-07-22 — Local deletes are debounced 3s to survive cloud-sync transients
+
+**Decision:** `packages/plugin/src/delete-debounce.ts` holds local `delete` events for 3s before propagating. `onCreate` for the same path cancels the pending delete; the manifest observer also cancels when a remote peer broadcasts the file still exists; a fire-time `fileExists()` re-check aborts propagation if the file is somehow back on disk.
+
+**Why:** OneDrive, Dropbox, and iCloud routinely remove a file from disk for a fraction of a second mid-sync. Obsidian's file watcher reports that as `delete`. Propagating immediately caused peers to permanently lose files that would have reappeared ~1s later. Root cause of at least one confirmed data-loss incident.
+
+**Rejected alternatives:**
+- No debounce, filter on file size / mtime: unreliable across sync engines.
+- Ignore `delete` events entirely, require explicit user confirmation: breaks legitimate deletions.
+- Longer debounce (10s+): makes real deletions feel laggy for collaborators.
+
+Test coverage in `packages/plugin/src/delete-debounce.test.ts` (12 cases, `npx tsx --test`).
+
+---
+
+## 2026-07-22 — Ghost-restoration prevention via manifest-cascade + defensive bindState
+
+**Decision:** The relay's manifest `bindState` attaches a `files.observe()` cascade that destroys the in-memory per-file `Y.Doc` and deletes the `vault_docs` row on real deletes. Per-file `bindState` also consults `manifestHasFile()` and skips loading state for paths not in the manifest.
+
+**Why:** Deletes propagated only via the manifest map; per-file `vault_docs` rows were orphaned. A later create with the same path (e.g. two consecutive "Untitled.md") re-loaded the orphan into the new `Y.Doc`, making the file look "haunted" by the old content. The cascade handles new deletes at the source; the defensive `bindState` catches orphans from before the fix or from any future bug.
+
+**Load-bearing supporting mechanics:**
+- `BIND_STATE_ORIGIN` symbol on the late-arriving `applyUpdate` — the cascade observer and update handler ignore this origin so CRDT reconciliation tombstones don't fire phantom cascades or persist loops.
+- `purgedDocs` set marked synchronously in `purgePersistedDoc()` before any await — prevents a near-simultaneous `writeState` from resurrecting a just-deleted row.
+- Rename detection mirrors the plugin's pattern: two-pass over `event.changes.keys`, collect `renamedFrom` from adds/updates in the same batch, skip cascade for those paths.
+
+**Not implemented (deliberately):** the defensive `bindState` does NOT opportunistically clean orphan rows. A fire-and-forget DELETE races with the next scheduled UPSERT and can wipe fresh content. Orphans are harmless (never loaded); a one-time GC script can handle table bloat if it matters.
+
+**Also deferred:** preserving deleted content as recoverable history. Discussed and out of scope for the fix.
