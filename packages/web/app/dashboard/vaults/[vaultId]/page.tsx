@@ -2,7 +2,7 @@
 
 import { useEffect, useState, use } from 'react';
 import { relay, RelayError } from '@/lib/relay';
-import type { Vault, VaultMember } from '@/lib/types';
+import type { Vault, VaultMember, InviteResult } from '@/lib/types';
 import { THEME } from '@/components/theme';
 import { useSession } from '@/lib/session';
 
@@ -86,15 +86,19 @@ export default function VaultDetail({ params }: Props) {
   const invite = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!inviteEmail.trim() || busy) return;
+    const target = inviteEmail.trim();
     setBusy(true);
     setInviteFlash(null);
     try {
-      const r = await relay<{ invited: true; signup_required: boolean }>(`/vaults/${vaultId}/invite`, {
-        method: 'POST', body: { email: inviteEmail.trim() },
+      const r = await relay<InviteResult>(`/vaults/${vaultId}/invite`, {
+        method: 'POST', body: { email: target },
       });
-      setInviteFlash(r.signup_required
-        ? `Invite sent to ${inviteEmail.trim()}. They'll be added when they sign up.`
-        : `${inviteEmail.trim()} has been added.`);
+      let msg: string;
+      if (r.invited && r.signup_required) msg = `Invite sent to ${target}. They'll see it in their dashboard after signing up.`;
+      else if (r.invited && r.already === 'invited') msg = `${target} was already invited — no new notification sent.`;
+      else if (r.invited) msg = `Invited ${target}. They'll see the invitation in their dashboard.`;
+      else msg = `${target} is already a member of this vault.`;
+      setInviteFlash(msg);
       setInviteEmail('');
       await load();
     } catch (e) { setError(errMsg(e)); }
@@ -166,30 +170,37 @@ export default function VaultDetail({ params }: Props) {
 
       <Section title="Members">
         <ul style={styles.memberList}>
-          {members.map((m) => {
-            const name = m.profiles?.display_name ?? m.user_id.slice(0, 8);
-            const color = m.profiles?.color ?? THEME.accent;
-            const initials = (name[0] ?? '?').toUpperCase();
-            const isSelf = m.user_id === myUserId;
-            const isOwnerRow = m.user_id === vault.owner_id;
-            return (
-              <li key={m.user_id} style={styles.memberRow}>
-                <div style={{ ...styles.memberAvatar, background: color }}>{initials}</div>
-                <div style={{ flex: 1 }}>
-                  <div style={{ color: THEME.textBright, fontSize: 13 }}>
-                    {name}
-                    {isSelf && <span style={styles.subtle}> (you)</span>}
-                    {isOwnerRow && <span style={styles.badge}>Owner</span>}
-                  </div>
-                  <div style={styles.subtle}>Joined {new Date(m.joined_at).toLocaleDateString()}</div>
-                </div>
-                {isOwner && !isOwnerRow && (
-                  <button type="button" onClick={() => removeMember(m.user_id, name)} style={styles.dangerLinkBtn}>Remove</button>
-                )}
-              </li>
-            );
-          })}
+          {members.filter((m) => m.status === 'active').map((m) => (
+            <MemberRow
+              key={m.user_id}
+              m={m}
+              vault={vault}
+              myUserId={myUserId}
+              isOwner={isOwner}
+              onRemove={removeMember}
+            />
+          ))}
         </ul>
+        {members.some((m) => m.status === 'invited') && (
+          <>
+            <div style={{ ...styles.subtle, marginTop: 20, marginBottom: 6 }}>
+              Pending invitations
+            </div>
+            <ul style={styles.memberList}>
+              {members.filter((m) => m.status === 'invited').map((m) => (
+                <MemberRow
+                  key={m.user_id}
+                  m={m}
+                  vault={vault}
+                  myUserId={myUserId}
+                  isOwner={isOwner}
+                  onRemove={removeMember}
+                  invited
+                />
+              ))}
+            </ul>
+          </>
+        )}
       </Section>
 
       <Section title="Invite people">
@@ -299,6 +310,44 @@ export default function VaultDetail({ params }: Props) {
   );
 }
 
+function MemberRow({
+  m, vault, myUserId, isOwner, onRemove, invited,
+}: {
+  m: VaultMember;
+  vault: Vault;
+  myUserId: string | undefined;
+  isOwner: boolean;
+  onRemove: (userId: string, displayName: string) => void;
+  invited?: boolean;
+}) {
+  const name = m.profiles?.display_name ?? m.user_id.slice(0, 8);
+  const color = m.profiles?.color ?? THEME.accent;
+  const initials = (name[0] ?? '?').toUpperCase();
+  const isSelf = m.user_id === myUserId;
+  const isOwnerRow = m.user_id === vault.owner_id;
+  return (
+    <li style={styles.memberRow}>
+      <div style={{ ...styles.memberAvatar, background: color, opacity: invited ? 0.5 : 1 }}>{initials}</div>
+      <div style={{ flex: 1 }}>
+        <div style={{ color: THEME.textBright, fontSize: 13 }}>
+          {name}
+          {isSelf && <span style={styles.subtle}> (you)</span>}
+          {isOwnerRow && <span style={styles.badge}>Owner</span>}
+          {invited && <span style={styles.invitedBadge}>Invited</span>}
+        </div>
+        <div style={styles.subtle}>
+          {invited ? 'Waiting to accept' : `Joined ${new Date(m.joined_at).toLocaleDateString()}`}
+        </div>
+      </div>
+      {isOwner && !isOwnerRow && (
+        <button type="button" onClick={() => onRemove(m.user_id, name)} style={styles.dangerLinkBtn}>
+          {invited ? 'Revoke' : 'Remove'}
+        </button>
+      )}
+    </li>
+  );
+}
+
 function Section({ title, tone, children }: { title: string; tone?: 'danger'; children: React.ReactNode }) {
   return (
     <section style={{
@@ -403,6 +452,16 @@ const styles: Record<string, React.CSSProperties> = {
     marginLeft: 8,
     padding: '2px 8px',
     background: THEME.accentSoft,
+    color: THEME.link,
+    borderRadius: 10,
+    fontSize: 10,
+    fontWeight: 500,
+    verticalAlign: 'middle',
+  },
+  invitedBadge: {
+    marginLeft: 8,
+    padding: '2px 8px',
+    background: 'rgba(167,139,250,0.14)',
     color: THEME.link,
     borderRadius: 10,
     fontSize: 10,

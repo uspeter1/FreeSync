@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { relay, RelayError } from '@/lib/relay';
-import type { Vault } from '@/lib/types';
+import type { Vault, MembershipStatus } from '@/lib/types';
 import { THEME } from '@/components/theme';
 import { useSession } from '@/lib/session';
 
@@ -127,29 +127,103 @@ export default function DashboardHome() {
 
       {vaults === null && !error && <div style={styles.muted}>Loading…</div>}
 
-      {vaults && vaults.length === 0 && (
-        <div style={styles.empty}>
-          <div style={{ fontSize: 15, color: THEME.textBright, marginBottom: 6 }}>No vaults yet</div>
-          <div style={styles.muted}>Create a new vault above, or join one with an invite code.</div>
-        </div>
-      )}
+      {vaults && (() => {
+        // Each entry has exactly one vault_members row (filtered server-side
+        // to the caller). Read its status once here.
+        const myStatus = (v: Vault): MembershipStatus =>
+          (v.vault_members?.[0]?.status ?? 'active') as MembershipStatus;
+        const invited = vaults.filter((v) => myStatus(v) === 'invited');
+        const active = vaults.filter((v) => myStatus(v) === 'active');
 
-      {vaults && vaults.length > 0 && (
-        <ul style={styles.list}>
-          {vaults.map((v) => (
-            <li key={v.id}>
-              <a href={`/dashboard/vaults/${v.id}`} style={styles.card}>
-                <div style={styles.cardTitle}>{v.name}</div>
-                <div style={styles.cardMeta}>
-                  {v.owner_id === myUserId && <span style={styles.badge}>Owner</span>}
-                  <span>{v.vault_members?.length ?? 0} member{(v.vault_members?.length ?? 0) === 1 ? '' : 's'}</span>
-                </div>
-              </a>
-            </li>
-          ))}
-        </ul>
-      )}
+        if (active.length === 0 && invited.length === 0) {
+          return (
+            <div style={styles.empty}>
+              <div style={{ fontSize: 15, color: THEME.textBright, marginBottom: 6 }}>No vaults yet</div>
+              <div style={styles.muted}>Create a new vault above, or join one with an invite code.</div>
+            </div>
+          );
+        }
+
+        return (
+          <>
+            {invited.length > 0 && (
+              <section style={{ marginBottom: 32 }}>
+                <h2 style={styles.sectionHeading}>Pending invitations</h2>
+                <ul style={styles.list}>
+                  {invited.map((v) => (
+                    <InvitedCard
+                      key={v.id}
+                      vault={v}
+                      busy={busy}
+                      onDone={() => { void load(); }}
+                      setError={setError}
+                      setBusy={setBusy}
+                    />
+                  ))}
+                </ul>
+              </section>
+            )}
+
+            {active.length > 0 && (
+              <section>
+                {invited.length > 0 && <h2 style={styles.sectionHeading}>Your vaults</h2>}
+                <ul style={styles.list}>
+                  {active.map((v) => (
+                    <li key={v.id}>
+                      <a href={`/dashboard/vaults/${v.id}`} style={styles.card}>
+                        <div style={styles.cardTitle}>{v.name}</div>
+                        <div style={styles.cardMeta}>
+                          {v.owner_id === myUserId && <span style={styles.badge}>Owner</span>}
+                          <span>{v.active_member_count} member{v.active_member_count === 1 ? '' : 's'}</span>
+                        </div>
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
+          </>
+        );
+      })()}
     </div>
+  );
+}
+
+function InvitedCard({
+  vault, busy, onDone, setError, setBusy,
+}: {
+  vault: Vault;
+  busy: boolean;
+  onDone: () => void;
+  setError: (e: string) => void;
+  setBusy: (b: boolean) => void;
+}) {
+  const call = async (action: 'accept' | 'decline') => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await relay(`/vaults/${vault.id}/${action}`, { method: 'POST' });
+      onDone();
+    } catch (e) {
+      setError(e instanceof RelayError ? e.message : String(e));
+    } finally { setBusy(false); }
+  };
+  return (
+    <li>
+      <div style={styles.invitedCard}>
+        <div>
+          <div style={styles.cardTitle}>{vault.name}</div>
+          <div style={styles.cardMeta}>
+            <span style={styles.invitedBadge}>Invited</span>
+            <span>You&apos;ve been invited to collaborate.</span>
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button type="button" onClick={() => call('decline')} disabled={busy} style={styles.secondaryBtn}>Decline</button>
+          <button type="button" onClick={() => call('accept')} disabled={busy} style={styles.primaryBtn}>Accept</button>
+        </div>
+      </div>
+    </li>
   );
 }
 
@@ -259,6 +333,33 @@ const styles: Record<string, React.CSSProperties> = {
   badge: {
     padding: '2px 8px',
     background: THEME.accentSoft,
+    color: THEME.link,
+    borderRadius: 10,
+    fontSize: 11,
+    fontWeight: 500,
+  },
+  sectionHeading: {
+    fontSize: 12,
+    fontWeight: 600,
+    color: THEME.textMuted,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginBottom: 10,
+  },
+  invitedCard: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '16px 18px',
+    background: THEME.surface,
+    border: `1px solid ${THEME.link}`,
+    borderRadius: 8,
+    marginBottom: 10,
+    gap: 16,
+  },
+  invitedBadge: {
+    padding: '2px 8px',
+    background: 'rgba(167,139,250,0.14)',
     color: THEME.link,
     borderRadius: 10,
     fontSize: 11,

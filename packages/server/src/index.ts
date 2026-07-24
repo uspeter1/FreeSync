@@ -373,14 +373,43 @@ app.get('/vaults', async (req: Request, res: Response) => {
   if (auth.error) { res.status(401).json({ error: auth.error }); return; }
   const { userId } = auth;
 
+  // Returns every vault the caller has any membership row for — both 'active'
+  // (fully joined) and 'invited' (pending accept). The client renders them in
+  // separate sections. WS auth still gates sync on status='active', so an
+  // invited membership row doesn't grant content access.
+  //
+  // NOTE: the embedded vault_members is filtered to the caller only (see the
+  // .eq below), so it holds a single row describing the caller's own status.
+  // A separate lookup fills in `active_member_count` — the total count of
+  // active members for each vault, for the dashboard's card meta.
   const { data, error } = await supabase
     .from('vaults')
     .select('*, vault_members!inner(user_id, status)')
     .eq('vault_members.user_id', userId)
-    .eq('vault_members.status', 'active');
+    .in('vault_members.status', ['active', 'invited']);
 
   if (error) { res.status(500).json({ error: error.message }); return; }
-  res.json(data);
+
+  const vaultIds = (data ?? []).map((v) => v.id);
+  if (vaultIds.length === 0) { res.json([]); return; }
+
+  const { data: allActive, error: countErr } = await supabase
+    .from('vault_members')
+    .select('vault_id')
+    .in('vault_id', vaultIds)
+    .eq('status', 'active');
+  if (countErr) { res.status(500).json({ error: countErr.message }); return; }
+
+  const counts = new Map<string, number>();
+  for (const row of allActive ?? []) {
+    counts.set(row.vault_id, (counts.get(row.vault_id) ?? 0) + 1);
+  }
+
+  const enriched = (data ?? []).map((v) => ({
+    ...v,
+    active_member_count: counts.get(v.id) ?? 0,
+  }));
+  res.json(enriched);
 });
 
 // ── POST /vaults/:vaultId/join ────────────────────────────────────────────────
@@ -518,14 +547,100 @@ app.post('/vaults/:vaultId/invite', async (req: Request, res: Response) => {
     return;
   }
 
-  // Add directly to vault_members — no code required
+  // Check current membership so we can respond meaningfully (and never
+  // downgrade an active member to invited).
+  const { data: existing } = await supabase
+    .from('vault_members')
+    .select('status')
+    .eq('vault_id', vaultId)
+    .eq('user_id', targetUser.id)
+    .maybeSingle();
+
+  if (existing?.status === 'active') {
+    res.json({ invited: false, already: 'member', signup_required: false });
+    return;
+  }
+  if (existing?.status === 'invited') {
+    res.json({ invited: true, already: 'invited', signup_required: false });
+    return;
+  }
+
   const { error: memberErr } = await supabase
     .from('vault_members')
-    .upsert({ vault_id: vaultId, user_id: targetUser.id, status: 'active' }, { onConflict: 'vault_id,user_id' });
+    .insert({ vault_id: vaultId, user_id: targetUser.id, status: 'invited' });
 
   if (memberErr) { res.status(500).json({ error: memberErr.message }); return; }
 
   res.json({ invited: true, signup_required: false });
+});
+
+// ── POST /vaults/:vaultId/accept ─────────────────────────────────────────────
+// Called by the invitee to promote their invited membership to active. WS
+// auth gates on status='active', so an invited row can't sync until this runs.
+app.post('/vaults/:vaultId/accept', async (req: Request, res: Response) => {
+  const auth = await authenticate(req.headers.authorization);
+  if (auth.error) { res.status(401).json({ error: auth.error }); return; }
+  const { userId } = auth;
+  const { vaultId } = req.params;
+
+  const { data: existing } = await supabase
+    .from('vault_members')
+    .select('status')
+    .eq('vault_id', vaultId)
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  if (!existing) { res.status(404).json({ error: 'No invitation found' }); return; }
+  if (existing.status === 'active') {
+    res.json({ accepted: true, already: 'member' });
+    return;
+  }
+  if (existing.status !== 'invited') {
+    res.status(400).json({ error: `Cannot accept from status "${existing.status}"` });
+    return;
+  }
+
+  const { error } = await supabase
+    .from('vault_members')
+    .update({ status: 'active' })
+    .eq('vault_id', vaultId)
+    .eq('user_id', userId);
+  if (error) { res.status(500).json({ error: error.message }); return; }
+  res.json({ accepted: true });
+});
+
+// ── POST /vaults/:vaultId/decline ────────────────────────────────────────────
+// Called by the invitee to reject an invitation. Deletes their row so the
+// owner has to re-invite if they want to try again. Explicitly rejects
+// declining if the caller is already an active member (they should /leave
+// instead) so this endpoint can't accidentally kick someone off a vault
+// they've already joined.
+app.post('/vaults/:vaultId/decline', async (req: Request, res: Response) => {
+  const auth = await authenticate(req.headers.authorization);
+  if (auth.error) { res.status(401).json({ error: auth.error }); return; }
+  const { userId } = auth;
+  const { vaultId } = req.params;
+
+  const { data: existing } = await supabase
+    .from('vault_members')
+    .select('status')
+    .eq('vault_id', vaultId)
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  if (!existing) { res.status(404).json({ error: 'No invitation found' }); return; }
+  if (existing.status === 'active') {
+    res.status(400).json({ error: 'You are already a member. Use leave instead.' });
+    return;
+  }
+
+  const { error } = await supabase
+    .from('vault_members')
+    .delete()
+    .eq('vault_id', vaultId)
+    .eq('user_id', userId);
+  if (error) { res.status(500).json({ error: error.message }); return; }
+  res.json({ declined: true });
 });
 
 // ── GET /vaults/:vaultId/members ─────────────────────────────────────────────
@@ -549,15 +664,16 @@ app.get('/vaults/:vaultId/members', async (req: Request, res: Response) => {
     return;
   }
 
-  // Two queries + stitch in code: PostgREST can't embed profiles because
-  // there's no declared FK between vault_members.user_id and profiles.id.
-  // Adding the FK would be a schema change; doing two round-trips is fine
-  // for the small member counts this returns.
+  // Return both active members AND invited (pending) members. UI distinguishes
+  // via the status field. Two queries + stitch in code: PostgREST can't embed
+  // profiles because there's no declared FK between vault_members.user_id and
+  // profiles.id. Adding the FK would be a schema change; two round-trips are
+  // fine for the small member counts this returns.
   const { data: memberRows, error: memberErr } = await supabase
     .from('vault_members')
     .select('user_id, status, joined_at')
     .eq('vault_id', vaultId)
-    .eq('status', 'active');
+    .in('status', ['active', 'invited']);
   if (memberErr) { res.status(500).json({ error: memberErr.message }); return; }
 
   const userIds = (memberRows ?? []).map((m) => m.user_id);
