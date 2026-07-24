@@ -181,27 +181,25 @@ export default function VaultDetail({ params }: Props) {
             />
           ))}
         </ul>
-        {members.some((m) => m.status === 'invited') && (
-          <>
-            <div style={{ ...styles.subtle, marginTop: 20, marginBottom: 6 }}>
-              Pending invitations
-            </div>
-            <ul style={styles.memberList}>
-              {members.filter((m) => m.status === 'invited').map((m) => (
-                <MemberRow
-                  key={m.user_id}
-                  m={m}
-                  vault={vault}
-                  myUserId={myUserId}
-                  isOwner={isOwner}
-                  onRemove={removeMember}
-                  invited
-                />
-              ))}
-            </ul>
-          </>
-        )}
       </Section>
+
+      {members.some((m) => m.status === 'invited') && (
+        <Section title="Invitations">
+          <ul style={styles.memberList}>
+            {members.filter((m) => m.status === 'invited').map((m) => (
+              <MemberRow
+                key={m.user_id}
+                m={m}
+                vault={vault}
+                myUserId={myUserId}
+                isOwner={isOwner}
+                onRemove={removeMember}
+                invited
+              />
+            ))}
+          </ul>
+        </Section>
+      )}
 
       <Section title="Invite people">
         {isOwner && (
