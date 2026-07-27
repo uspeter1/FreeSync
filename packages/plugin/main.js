@@ -30435,6 +30435,7 @@ function deepEqual(a, b) {
 var LOCAL_ORIGIN2 = "local";
 var STORAGE_BUCKET = "vault-assets";
 var DELETE_DEBOUNCE_MS = 3e3;
+var RECONCILE_INTERVAL_MS = 3e4;
 var BINARY_EXTENSIONS = /* @__PURE__ */ new Set([
   "png",
   "jpg",
@@ -30492,6 +30493,8 @@ var SyncManager = class {
     this.remoteFileOps = /* @__PURE__ */ new Set();
     // storageKeys we just uploaded — prevents re-download loop
     this.recentlyUploaded = /* @__PURE__ */ new Set();
+    // Handle for the periodic reconciliation sweep — see reconcileLocalFiles.
+    this.reconcileTimer = null;
     this.onFileConnected = null;
     this.deleteDebouncer = new DeleteDebouncer({
       delayMs: DELETE_DEBOUNCE_MS,
@@ -30509,6 +30512,44 @@ var SyncManager = class {
       fileMap?.delete(path);
     }, LOCAL_ORIGIN2);
     this.disconnectFile(path);
+  }
+  // Periodic backstop for files that appeared on disk without firing
+  // Vault.on('create'). Common cause: community plugins that write via
+  // app.vault.adapter.write*() (bypasses Vault events entirely). This walks
+  // the current vault, diffs against the manifest, and adds any local-only
+  // file — same code path as onCreate.
+  //
+  // Only ADDS. Removals stay with the delete-debouncer / onDelete flow so
+  // we don't race against pending debounces or accidentally propagate a
+  // filesystem hiccup as a deletion.
+  async reconcileLocalFiles() {
+    if (!this.settings || !this.manifestDoc)
+      return;
+    const fileMap = this.manifestDoc.getMap("files");
+    const localFiles = this.app.vault.getFiles();
+    for (const file of localFiles) {
+      if (this.remoteFileOps.has(file.path))
+        continue;
+      const entry = fileMap.get(file.path);
+      if (entry?.exists)
+        continue;
+      if (isBinaryFile(file.path)) {
+        try {
+          await this.uploadBinaryFile(file);
+        } catch (err) {
+          console.error("[FreeSync] reconcile: binary upload failed", file.path, err);
+        }
+      } else {
+        this.manifestDoc.transact(() => {
+          fileMap.set(file.path, { exists: true });
+        }, LOCAL_ORIGIN2);
+        try {
+          await this.connectFile(file.path);
+        } catch (err) {
+          console.error("[FreeSync] reconcile: connectFile failed", file.path, err);
+        }
+      }
+    }
   }
   getComments(filePath) {
     return this.commentsMaps.get(filePath) ?? null;
@@ -30531,6 +30572,14 @@ var SyncManager = class {
     this.presence.setActiveFile(activeFile?.path ?? null);
     if (activeFile && !isBinaryFile(activeFile.path))
       await this.connectFile(activeFile.path);
+    this.manifestProvider?.on("sync", (isSynced) => {
+      if (!isSynced || this.reconcileTimer)
+        return;
+      void this.reconcileLocalFiles();
+      this.reconcileTimer = setInterval(() => {
+        void this.reconcileLocalFiles();
+      }, RECONCILE_INTERVAL_MS);
+    });
   }
   // ── Manifest room ──────────────────────────────────────────────────────────
   connectManifest() {
@@ -30966,6 +31015,10 @@ var SyncManager = class {
       unsub();
     this.unsubscribers = [];
     this.deleteDebouncer.cancelAll();
+    if (this.reconcileTimer) {
+      clearInterval(this.reconcileTimer);
+      this.reconcileTimer = null;
+    }
     this.manifestProvider?.destroy();
     this.manifestDoc?.destroy();
     for (const provider of this.providers.values())

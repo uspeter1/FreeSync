@@ -20,6 +20,13 @@ const STORAGE_BUCKET = 'vault-assets';
 // them if a `create` for the same path arrives.
 const DELETE_DEBOUNCE_MS = 3000;
 
+// Interval for the periodic reconciliation sweep — catches files that ended
+// up on disk without firing Obsidian's Vault events (community plugins that
+// write via app.vault.adapter.write() bypass Vault.on('create'/'modify'),
+// which is what watchVault listens for). The sweep is cheap (getFiles() is
+// in-memory) so a short interval is fine.
+const RECONCILE_INTERVAL_MS = 30_000;
+
 const BINARY_EXTENSIONS = new Set([
   'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico',
   'pdf', 'mp3', 'mp4', 'mov', 'avi', 'wav',
@@ -76,6 +83,8 @@ export class SyncManager {
   private recentlyUploaded = new Set<string>();
   // Per-path debounce coordinator for local deletions (see DELETE_DEBOUNCE_MS)
   private deleteDebouncer: DeleteDebouncer;
+  // Handle for the periodic reconciliation sweep — see reconcileLocalFiles.
+  private reconcileTimer: ReturnType<typeof setInterval> | null = null;
   onFileConnected: ((filePath: string, yComments: Y.Map<Y.Map<any>>) => void) | null = null;
 
   constructor(private app: App, private presence: PresenceManager) {
@@ -99,6 +108,38 @@ export class SyncManager {
     this.disconnectFile(path);
   }
 
+  // Periodic backstop for files that appeared on disk without firing
+  // Vault.on('create'). Common cause: community plugins that write via
+  // app.vault.adapter.write*() (bypasses Vault events entirely). This walks
+  // the current vault, diffs against the manifest, and adds any local-only
+  // file — same code path as onCreate.
+  //
+  // Only ADDS. Removals stay with the delete-debouncer / onDelete flow so
+  // we don't race against pending debounces or accidentally propagate a
+  // filesystem hiccup as a deletion.
+  private async reconcileLocalFiles(): Promise<void> {
+    if (!this.settings || !this.manifestDoc) return;
+    const fileMap = this.manifestDoc.getMap<FileEntry>('files');
+    const localFiles = this.app.vault.getFiles();
+    for (const file of localFiles) {
+      if (this.remoteFileOps.has(file.path)) continue;
+      const entry = fileMap.get(file.path);
+      if (entry?.exists) continue; // already in manifest → nothing to do
+
+      // Binary vs text branch mirrors onCreate.
+      if (isBinaryFile(file.path)) {
+        try { await this.uploadBinaryFile(file); }
+        catch (err) { console.error('[FreeSync] reconcile: binary upload failed', file.path, err); }
+      } else {
+        this.manifestDoc.transact(() => {
+          fileMap.set(file.path, { exists: true });
+        }, LOCAL_ORIGIN);
+        try { await this.connectFile(file.path); }
+        catch (err) { console.error('[FreeSync] reconcile: connectFile failed', file.path, err); }
+      }
+    }
+  }
+
   getComments(filePath: string): Y.Map<Y.Map<any>> | null {
     return this.commentsMaps.get(filePath) ?? null;
   }
@@ -119,6 +160,16 @@ export class SyncManager {
     const activeFile = this.app.workspace.getActiveFile();
     this.presence.setActiveFile(activeFile?.path ?? null);
     if (activeFile && !isBinaryFile(activeFile.path)) await this.connectFile(activeFile.path);
+
+    // Reconciliation: waits for the manifest to sync before it can safely diff
+    // (otherwise it would think the manifest is empty and add every local
+    // file, creating spurious "add" events for the peer). Starts one sweep
+    // immediately after sync and then every RECONCILE_INTERVAL_MS.
+    this.manifestProvider?.on('sync', (isSynced: boolean) => {
+      if (!isSynced || this.reconcileTimer) return;
+      void this.reconcileLocalFiles();
+      this.reconcileTimer = setInterval(() => { void this.reconcileLocalFiles(); }, RECONCILE_INTERVAL_MS);
+    });
   }
 
   // ── Manifest room ──────────────────────────────────────────────────────────
@@ -589,6 +640,7 @@ export class SyncManager {
     for (const unsub of this.unsubscribers) unsub();
     this.unsubscribers = [];
     this.deleteDebouncer.cancelAll();
+    if (this.reconcileTimer) { clearInterval(this.reconcileTimer); this.reconcileTimer = null; }
     this.manifestProvider?.destroy();
     this.manifestDoc?.destroy();
     for (const provider of this.providers.values()) provider.destroy();
