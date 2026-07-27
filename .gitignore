@@ -23,3 +23,7 @@ ios/Pods/
 web-build/
 scripts/dev-reload.py
 packages/web/.next/
+# Session artifacts from browser automation / screenshots
+.playwright-mcp/
+page-current.png
+page-*.png

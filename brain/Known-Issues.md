@@ -54,6 +54,12 @@ Status values: `[OPEN]` `[IN PROGRESS]` `[FIXED]` `[DEFERRED]` `[WONTFIX]`
 - `[DEFERRED]` Share link + invite by email — P1, requires email infra
 - `[DEFERRED]` **File history / recoverable deletions** — the ghost-restore fix intentionally purges deleted content rather than preserving it. A separate feature could add a `vault_doc_versions` table + `INSERT ... SELECT` before each cascade-delete, plus a restoration UX. Discussed 2026-07-22, not yet planned.
 - `[DEFERRED]` **Vault_docs orphan-row GC** — the defensive `bindState` path deliberately does NOT clean orphan rows (a fire-and-forget DELETE races with the next upsert and can wipe fresh content). Orphans are harmless (never loaded again) but accumulate as table bloat over time. A one-time GC script could scan `vault_docs` and delete rows whose `file_path` is not in the corresponding `__manifest__` doc's `files` map. Not urgent — no functional impact.
+
+- `[DEFERRED]` **Relay host decision at final deploy** — using Fly.io for testing (2026-07). Free tier covers the WebSocket relay while it's low-traffic. Revisit before production launch:
+  - **Fly.io**: current choice. Global edge machines, real WebSocket support, SSH-into-machines debugging, pay-as-you-go. Free allocation shrank in 2024 — hits paid quickly if traffic spikes.
+  - **Railway**: previous choice, trial expired 2026-07 forcing switch. Simpler UX, $5/mo Hobby credit-based, git-push-to-deploy. Less debugging insight than Fly.
+  - **Hetzner + Docker** (Phase 4 plan): dedicated VM, cheapest per unit at scale, most control, most ops work. Matches the "self-hostable" story in the roadmap.
+  Recommendation when Phase 4 arrives: skip Railway (no advantage over Fly for our shape), pick between "stay on Fly" (easy) or "move to Hetzner" (cheaper at scale, aligns with self-host docker image goal).
 - `[OPEN]` **Prod relay URL 404** — `https://freesync-production.up.railway.app/health` returned `404 Application not found` on 2026-07-22. The Railway app appears removed or renamed. Prod may have moved or been retired. Verify current URL before assuming prod deploy target.
 
 ---
