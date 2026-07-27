@@ -5,6 +5,10 @@ import { SupabaseClient } from '@supabase/supabase-js';
 import { PresenceManager } from './presence';
 import { minimalDiff } from './diff';
 import { DeleteDebouncer } from './delete-debounce';
+import {
+  isCanvasFile, applyCanvasFromDisk, serializeCanvasToDisk,
+  getCanvasNodes, getCanvasEdges,
+} from './canvas-sync';
 
 const LOCAL_ORIGIN = 'local';
 const STORAGE_BUCKET = 'vault-assets';
@@ -250,15 +254,16 @@ export class SyncManager {
     this.unsubscribers.push(() => fileMap.unobserve(onFileMapChange));
   }
 
-  // ── Per-file rooms (text only) ─────────────────────────────────────────────
+  // ── Per-file rooms (text + canvas) ────────────────────────────────────────
 
   async connectFile(filePath: string) {
     if (!this.settings || this.providers.has(filePath)) return;
     if (isBinaryFile(filePath)) return;
     const { relayUrl, vaultId, userToken } = this.settings;
+    const isCanvas = isCanvasFile(filePath);
 
     const doc = new Y.Doc();
-    const yText = doc.getText('content');
+    const yText = doc.getText('content');       // text files
     const yComments = doc.getMap<Y.Map<any>>('comments');
 
     const baseUrl = relayUrl.replace(/\/sync$/, '');
@@ -271,6 +276,10 @@ export class SyncManager {
     this.commentsMaps.set(filePath, yComments);
     this.onFileConnected?.(filePath, yComments);
 
+    // On first-sync, decide who's the source of truth: if the Y.Doc came back
+    // empty, seed it from disk; if it came back with state that differs from
+    // disk, write the remote state to disk. Canvas uses structured Y.Maps
+    // (nodes + edges); text uses yText.
     provider.on('sync', async (isSynced: boolean) => {
       if (!isSynced) return;
       await new Promise(r => setTimeout(r, 800));
@@ -278,25 +287,40 @@ export class SyncManager {
       const file = this.app.vault.getAbstractFileByPath(filePath);
       if (!(file instanceof TFile)) return;
 
-      if (yText.toString() === '') {
+      if (isCanvas) {
+        const nodesEmpty = getCanvasNodes(doc).size === 0;
+        const edgesEmpty = getCanvasEdges(doc).size === 0;
         const localContent = await this.app.vault.read(file);
-        if (localContent) {
-          doc.transact(() => { yText.insert(0, localContent); }, LOCAL_ORIGIN);
+        if (nodesEmpty && edgesEmpty) {
+          if (localContent.trim()) applyCanvasFromDisk(doc, localContent);
+        } else {
+          const remoteContent = serializeCanvasToDisk(doc);
+          if (remoteContent !== localContent) {
+            await this.app.vault.modify(file, remoteContent);
+          }
         }
       } else {
-        const remoteContent = yText.toString();
-        const localContent = await this.app.vault.read(file);
-        if (remoteContent !== localContent) {
-          await this.app.vault.modify(file, remoteContent);
+        if (yText.toString() === '') {
+          const localContent = await this.app.vault.read(file);
+          if (localContent) {
+            doc.transact(() => { yText.insert(0, localContent); }, LOCAL_ORIGIN);
+          }
+        } else {
+          const remoteContent = yText.toString();
+          const localContent = await this.app.vault.read(file);
+          if (remoteContent !== localContent) {
+            await this.app.vault.modify(file, remoteContent);
+          }
         }
       }
     });
 
+    // On remote updates (origin !== LOCAL_ORIGIN), reflect them to disk.
     doc.on('update', async (_update: Uint8Array, origin: unknown) => {
       if (origin === LOCAL_ORIGIN) return;
       const file = this.app.vault.getAbstractFileByPath(filePath);
       if (!(file instanceof TFile)) return;
-      const remoteContent = yText.toString();
+      const remoteContent = isCanvas ? serializeCanvasToDisk(doc) : yText.toString();
       const localContent = await this.app.vault.read(file);
       if (remoteContent !== localContent) {
         await this.app.vault.modify(file, remoteContent);
@@ -398,18 +422,27 @@ export class SyncManager {
         return;
       }
 
-      // Text: Yjs minimal diff
       const doc = this.docs.get(file.path);
       if (!doc) return;
-      const yText = doc.getText('content');
       const newContent = await this.app.vault.read(file);
-      const oldContent = yText.toString();
-      if (newContent === oldContent) return;
-      const { index, deleteCount, insertText } = minimalDiff(oldContent, newContent);
-      doc.transact(() => {
-        if (deleteCount > 0) yText.delete(index, deleteCount);
-        if (insertText) yText.insert(index, insertText);
-      }, LOCAL_ORIGIN);
+
+      if (isCanvasFile(file.path)) {
+        // Canvas: reconcile the JSON into structured Y.Maps. Skips silently
+        // if the on-disk JSON is unparseable (half-written by Obsidian).
+        const before = serializeCanvasToDisk(doc);
+        if (before === newContent) return;
+        applyCanvasFromDisk(doc, newContent);
+      } else {
+        // Text: Yjs minimal diff
+        const yText = doc.getText('content');
+        const oldContent = yText.toString();
+        if (newContent === oldContent) return;
+        const { index, deleteCount, insertText } = minimalDiff(oldContent, newContent);
+        doc.transact(() => {
+          if (deleteCount > 0) yText.delete(index, deleteCount);
+          if (insertText) yText.insert(index, insertText);
+        }, LOCAL_ORIGIN);
+      }
 
       // Update manifest last-edited metadata
       if (this.manifestDoc) {

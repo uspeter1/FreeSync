@@ -30344,8 +30344,95 @@ var DeleteDebouncer = class {
   }
 };
 
-// src/sync.ts
+// src/canvas-sync.ts
 var LOCAL_ORIGIN = "local";
+function isCanvasFile(filePath) {
+  return filePath.toLowerCase().endsWith(".canvas");
+}
+function getCanvasNodes(doc) {
+  return doc.getMap("canvas-nodes");
+}
+function getCanvasEdges(doc) {
+  return doc.getMap("canvas-edges");
+}
+function applyCanvasFromDisk(doc, jsonText) {
+  let parsed;
+  try {
+    parsed = jsonText.trim() ? JSON.parse(jsonText) : {};
+  } catch {
+    return;
+  }
+  const yNodes = getCanvasNodes(doc);
+  const yEdges = getCanvasEdges(doc);
+  doc.transact(() => {
+    reconcileCollection(yNodes, parsed.nodes ?? []);
+    reconcileCollection(yEdges, parsed.edges ?? []);
+  }, LOCAL_ORIGIN);
+}
+function reconcileCollection(yColl, arr) {
+  const seenIds = /* @__PURE__ */ new Set();
+  for (const item of arr) {
+    if (!item || typeof item.id !== "string")
+      continue;
+    seenIds.add(item.id);
+    let entry = yColl.get(item.id);
+    if (!entry) {
+      entry = new YMap();
+      yColl.set(item.id, entry);
+    }
+    for (const [k, v] of Object.entries(item)) {
+      const existing = entry.get(k);
+      if (!deepEqual(existing, v))
+        entry.set(k, v);
+    }
+    for (const k of entry.keys()) {
+      if (!(k in item))
+        entry.delete(k);
+    }
+  }
+  for (const id2 of yColl.keys()) {
+    if (!seenIds.has(id2))
+      yColl.delete(id2);
+  }
+}
+function serializeCanvasToDisk(doc) {
+  const yNodes = getCanvasNodes(doc);
+  const yEdges = getCanvasEdges(doc);
+  const nodes = [...yNodes.entries()].map(([, entry]) => entry.toJSON()).sort(byId);
+  const edges = [...yEdges.entries()].map(([, entry]) => entry.toJSON()).sort(byId);
+  return JSON.stringify({ nodes, edges }, null, "	") + "\n";
+}
+function byId(a, b) {
+  return (a.id ?? "").localeCompare(b.id ?? "");
+}
+function deepEqual(a, b) {
+  if (a === b)
+    return true;
+  if (a == null || b == null)
+    return false;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length)
+      return false;
+    for (let i = 0; i < a.length; i++)
+      if (!deepEqual(a[i], b[i]))
+        return false;
+    return true;
+  }
+  if (typeof a === "object" && typeof b === "object") {
+    const ak = Object.keys(a);
+    const bk = Object.keys(b);
+    if (ak.length !== bk.length)
+      return false;
+    for (const k of ak)
+      if (!deepEqual(a[k], b[k]))
+        return false;
+    return true;
+  }
+  return false;
+}
+
+// src/sync.ts
+var LOCAL_ORIGIN2 = "local";
 var STORAGE_BUCKET = "vault-assets";
 var DELETE_DEBOUNCE_MS = 3e3;
 var BINARY_EXTENSIONS = /* @__PURE__ */ new Set([
@@ -30420,7 +30507,7 @@ var SyncManager = class {
     const fileMap = this.manifestDoc?.getMap("files");
     this.manifestDoc?.transact(() => {
       fileMap?.delete(path);
-    }, LOCAL_ORIGIN);
+    }, LOCAL_ORIGIN2);
     this.disconnectFile(path);
   }
   getComments(filePath) {
@@ -30562,13 +30649,14 @@ var SyncManager = class {
     fileMap.observe(onFileMapChange);
     this.unsubscribers.push(() => fileMap.unobserve(onFileMapChange));
   }
-  // ── Per-file rooms (text only) ─────────────────────────────────────────────
+  // ── Per-file rooms (text + canvas) ────────────────────────────────────────
   async connectFile(filePath) {
     if (!this.settings || this.providers.has(filePath))
       return;
     if (isBinaryFile(filePath))
       return;
     const { relayUrl, vaultId, userToken } = this.settings;
+    const isCanvas = isCanvasFile(filePath);
     const doc = new Doc();
     const yText = doc.getText("content");
     const yComments = doc.getMap("comments");
@@ -30587,28 +30675,43 @@ var SyncManager = class {
       const file = this.app.vault.getAbstractFileByPath(filePath);
       if (!(file instanceof import_obsidian.TFile))
         return;
-      if (yText.toString() === "") {
+      if (isCanvas) {
+        const nodesEmpty = getCanvasNodes(doc).size === 0;
+        const edgesEmpty = getCanvasEdges(doc).size === 0;
         const localContent = await this.app.vault.read(file);
-        if (localContent) {
-          doc.transact(() => {
-            yText.insert(0, localContent);
-          }, LOCAL_ORIGIN);
+        if (nodesEmpty && edgesEmpty) {
+          if (localContent.trim())
+            applyCanvasFromDisk(doc, localContent);
+        } else {
+          const remoteContent = serializeCanvasToDisk(doc);
+          if (remoteContent !== localContent) {
+            await this.app.vault.modify(file, remoteContent);
+          }
         }
       } else {
-        const remoteContent = yText.toString();
-        const localContent = await this.app.vault.read(file);
-        if (remoteContent !== localContent) {
-          await this.app.vault.modify(file, remoteContent);
+        if (yText.toString() === "") {
+          const localContent = await this.app.vault.read(file);
+          if (localContent) {
+            doc.transact(() => {
+              yText.insert(0, localContent);
+            }, LOCAL_ORIGIN2);
+          }
+        } else {
+          const remoteContent = yText.toString();
+          const localContent = await this.app.vault.read(file);
+          if (remoteContent !== localContent) {
+            await this.app.vault.modify(file, remoteContent);
+          }
         }
       }
     });
     doc.on("update", async (_update, origin) => {
-      if (origin === LOCAL_ORIGIN)
+      if (origin === LOCAL_ORIGIN2)
         return;
       const file = this.app.vault.getAbstractFileByPath(filePath);
       if (!(file instanceof import_obsidian.TFile))
         return;
-      const remoteContent = yText.toString();
+      const remoteContent = isCanvas ? serializeCanvasToDisk(doc) : yText.toString();
       const localContent = await this.app.vault.read(file);
       if (remoteContent !== localContent) {
         await this.app.vault.modify(file, remoteContent);
@@ -30653,7 +30756,7 @@ var SyncManager = class {
       const existing = fileMap?.get(file.path) ?? { exists: true };
       this.manifestDoc?.transact(() => {
         fileMap?.set(file.path, { ...existing, binary: true, storageKey, binaryVersion: Date.now() });
-      }, LOCAL_ORIGIN);
+      }, LOCAL_ORIGIN2);
     } catch (err) {
       console.error("[FreeSync] Storage upload error:", err);
     }
@@ -30711,18 +30814,25 @@ var SyncManager = class {
       const doc = this.docs.get(file.path);
       if (!doc)
         return;
-      const yText = doc.getText("content");
       const newContent = await this.app.vault.read(file);
-      const oldContent = yText.toString();
-      if (newContent === oldContent)
-        return;
-      const { index, deleteCount, insertText: insertText2 } = minimalDiff(oldContent, newContent);
-      doc.transact(() => {
-        if (deleteCount > 0)
-          yText.delete(index, deleteCount);
-        if (insertText2)
-          yText.insert(index, insertText2);
-      }, LOCAL_ORIGIN);
+      if (isCanvasFile(file.path)) {
+        const before = serializeCanvasToDisk(doc);
+        if (before === newContent)
+          return;
+        applyCanvasFromDisk(doc, newContent);
+      } else {
+        const yText = doc.getText("content");
+        const oldContent = yText.toString();
+        if (newContent === oldContent)
+          return;
+        const { index, deleteCount, insertText: insertText2 } = minimalDiff(oldContent, newContent);
+        doc.transact(() => {
+          if (deleteCount > 0)
+            yText.delete(index, deleteCount);
+          if (insertText2)
+            yText.insert(index, insertText2);
+        }, LOCAL_ORIGIN2);
+      }
       if (this.manifestDoc) {
         const fileMap = this.manifestDoc.getMap("files");
         const existing = fileMap.get(file.path) ?? { exists: true };
@@ -30736,7 +30846,7 @@ var SyncManager = class {
             },
             lastEditedAt: Date.now()
           });
-        }, LOCAL_ORIGIN);
+        }, LOCAL_ORIGIN2);
       }
       const yHistory = doc.getArray("history");
       const last2 = yHistory.length > 0 ? yHistory.get(yHistory.length - 1) : null;
@@ -30752,7 +30862,7 @@ var SyncManager = class {
           if (yHistory.length >= 20)
             yHistory.delete(0, 1);
           yHistory.push([entry]);
-        }, LOCAL_ORIGIN);
+        }, LOCAL_ORIGIN2);
       }
     };
     this.app.vault.on("modify", onModify);
@@ -30772,7 +30882,7 @@ var SyncManager = class {
       const fileMap = this.manifestDoc?.getMap("files");
       this.manifestDoc?.transact(() => {
         fileMap?.set(file.path, { exists: true });
-      }, LOCAL_ORIGIN);
+      }, LOCAL_ORIGIN2);
       await this.connectFile(file.path);
     };
     this.app.vault.on("create", onCreate);
@@ -30804,14 +30914,14 @@ var SyncManager = class {
         this.manifestDoc?.transact(() => {
           fileMap2?.delete(oldPath);
           fileMap2?.set(file.path, { exists: true, binary: true, storageKey: newKey, renamedFrom: oldPath, binaryVersion: Date.now() });
-        }, LOCAL_ORIGIN);
+        }, LOCAL_ORIGIN2);
         return;
       }
       const fileMap = this.manifestDoc?.getMap("files");
       this.manifestDoc?.transact(() => {
         fileMap?.delete(oldPath);
         fileMap?.set(file.path, { exists: true, renamedFrom: oldPath });
-      }, LOCAL_ORIGIN);
+      }, LOCAL_ORIGIN2);
       this.disconnectFile(oldPath);
       await this.connectFile(file.path);
     };
