@@ -1,22 +1,17 @@
 'use client';
-import React, { useState, useRef, useCallback, useEffect } from 'react';
+import React, { useState, useRef, useCallback } from 'react';
 import { ObsidianShell } from '@/components/Shell';
 import { HomePage } from '@/components/HomePage';
 import { GettingStartedPage, DocsPage, SelfHostingPage, BlogPage } from '@/components/Pages';
 import { GraphView } from '@/components/GraphView';
 import { QuickSwitcher } from '@/components/QuickSwitcher';
-import { supabase } from '@/lib/supabase';
+import { DashboardVaultList } from '@/components/DashboardVaultList';
 
+// The marketing home stays visitable for signed-in users too — they
+// reach the dashboard via /dashboard directly or via header affordances
+// on other pages. Sign-in flow itself lands on /dashboard (see
+// app/auth/signin/page.tsx).
 export default function Page() {
-  // Signed-in visitors go straight to the dashboard. Marketing home is for
-  // logged-out visitors. Client-side redirect (matches useRequireSession's
-  // pattern; no @supabase/ssr middleware installed).
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      if (data.session) window.location.href = '/dashboard';
-    });
-  }, []);
-
   const [activeTab,    setActiveTab]    = useState('home');
   const [commentsOpen, setCommentsOpen] = useState(true);
   const [graphOpen,    setGraphOpen]    = useState(false);
@@ -58,6 +53,7 @@ export default function Page() {
       case 'docs':            return <DocsPage />;
       case 'self-hosting':    return <SelfHostingPage />;
       case 'blog':            return <BlogPage />;
+      case 'my-dashboard':    return <DashboardVaultList />;
       default:                return <HomePage proTipCount={proTipCount} />;
     }
   };

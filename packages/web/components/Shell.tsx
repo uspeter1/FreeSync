@@ -3,6 +3,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { THEME, USERS, YOU, PRESENCE_POOL, User } from './theme';
 import { Icon, UserBadge } from './Icon';
 import { RightPanel, PAGE_META, UserComment } from './RightPanel';
+import { useSession } from '@/lib/session';
 
 const TABS = [
   { id: 'home',            label: '1. Welcome to FreeSync', closeable: true  },
@@ -151,6 +152,8 @@ export function ObsidianShell({
 }: ShellProps) {
   const [leftOpen,      setLeftOpen]      = useState(true);
   const [presence,      setPresence]      = useState<Record<string, User[]>>({});
+  const sessionState = useSession();
+  const isSignedIn = !sessionState.loading && !!sessionState.session;
   const [activeSection, setActiveSection] = useState('');
   const [activeRibbon,  setActiveRibbon]  = useState('files');
   const [rightTab,      setRightTab]      = useState('comments');
@@ -335,6 +338,14 @@ export function ObsidianShell({
                 {tab.closeable && <span style={shS.tabClose}><Icon name="close" size={11} color={THEME.textMuted} /></span>}
               </button>
             ))}
+            {isSignedIn && (
+              <button
+                style={{ ...shS.tab, ...(activeTab === 'my-dashboard' ? shS.tabActive : {}) }}
+                onClick={() => setActiveTab('my-dashboard')}
+              >
+                <span style={shS.tabLabel}>My Dashboard</span>
+              </button>
+            )}
             <a href="https://github.com/freesync/freesync" target="_blank" rel="noopener noreferrer"
               style={{ ...shS.tab, textDecoration: 'none' }}>
               <span style={shS.tabLabel}>GitHub ↗</span>
