@@ -89,7 +89,12 @@ export class PresenceManager {
   private renderBadges() {
     if (!this.awareness) return;
 
-    const fileUsers = new Map<string, UserPresence[]>();
+    // Dedupe by user.id per file: the same user connected from two devices on
+    // the same file gets one badge on that file, not two. Multi-device
+    // presence across DIFFERENT files still shows both (a badge per file the
+    // user has open) — see brain/Decisions-Log.md 2026-05-13 for the original
+    // per-connection rationale and 2026-07 for the within-file dedupe update.
+    const fileUsers = new Map<string, Map<string, UserPresence>>();
     const localId = this.awareness.clientID;
 
     for (const [clientId, state] of this.awareness.getStates()) {
@@ -97,15 +102,18 @@ export class PresenceManager {
       const user = state.user as UserPresence;
       const file = (state.activeFile as string | null) ?? null;
       if (file) {
-        if (!fileUsers.has(file)) fileUsers.set(file, []);
-        fileUsers.get(file)!.push(user);
+        if (!fileUsers.has(file)) fileUsers.set(file, new Map());
+        // First writer wins; every client with the same user.id contributes
+        // identical display_name/color/initials, so ordering doesn't matter.
+        const byUser = fileUsers.get(file)!;
+        if (!byUser.has(user.id)) byUser.set(user.id, user);
       }
     }
 
     this.clearBadges();
 
-    for (const [filePath, users] of fileUsers) {
-      this.renderFileBadge(filePath, users);
+    for (const [filePath, byUser] of fileUsers) {
+      this.renderFileBadge(filePath, [...byUser.values()]);
     }
   }
 

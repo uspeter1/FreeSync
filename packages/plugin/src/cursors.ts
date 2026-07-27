@@ -1,4 +1,4 @@
-import { Extension, StateEffect } from '@codemirror/state';
+import { Extension, StateEffect, Range } from '@codemirror/state';
 import { EditorView, ViewPlugin, ViewUpdate, Decoration, DecorationSet, WidgetType } from '@codemirror/view';
 import { Awareness } from 'y-protocols/awareness';
 import { editorInfoField } from 'obsidian';
@@ -6,6 +6,10 @@ import { editorInfoField } from 'obsidian';
 export interface AwarenessRef {
   awareness: Awareness | null;
   localClientId: number;
+  // Supabase user.id of the signed-in account. When the same user is
+  // connected from multiple devices, cursors from those other devices
+  // render with the label "You" instead of the display name.
+  localUserId: string | null;
 }
 
 export interface RemoteCursorPos {
@@ -162,27 +166,47 @@ export function remoteCursorsExtension(ref: AwarenessRef): Extension {
 
       const docLen = view.state.doc.length;
       const now = Date.now();
-      const widgets: { from: number; value: Decoration }[] = [];
+      const decorations: Range<Decoration>[] = [];
 
       for (const [clientId, state] of ref.awareness.getStates()) {
         if (clientId === ref.localClientId) continue;
-        const user = state?.user as { display_name: string; color: string } | undefined;
+        const user = state?.user as { id: string; display_name: string; color: string } | undefined;
         const cursor = state?.cursor as RemoteCursorPos | undefined;
         const activeFile = state?.activeFile as string | null;
         if (!user || !cursor || activeFile !== filePath) continue;
 
-        const pos = Math.min(Math.max(cursor.head, 0), docLen);
+        const head = Math.min(Math.max(cursor.head, 0), docLen);
+        const anchor = Math.min(Math.max(cursor.anchor, 0), docLen);
         const isTyping = cursor.updatedAt > 0 && (now - cursor.updatedAt) < 3000;
+        // Same-user-different-device: label as "You" instead of their name.
+        const isSelf = ref.localUserId != null && user.id === ref.localUserId;
+        const label = isSelf ? 'You' : user.display_name;
 
-        widgets.push(
-          Decoration.widget({ widget: new CursorWidget(user.display_name, user.color, isTyping), side: 1 })
-            .range(pos)
+        // Selection range: light-tint the [anchor, head] span in the user's
+        // color. Trailing "33" is ~20% alpha (matches Google Docs' feel).
+        // Assumes user.color is a 6-hex value (profiles.color always is).
+        if (head !== anchor) {
+          const from = Math.min(head, anchor);
+          const to = Math.max(head, anchor);
+          decorations.push(
+            Decoration.mark({
+              attributes: { style: `background-color: ${user.color}33;` },
+            }).range(from, to)
+          );
+        }
+
+        // Caret / flag stays at head (right edge of a rightward drag,
+        // left edge of a leftward drag) — matches native editor behavior.
+        decorations.push(
+          Decoration.widget({ widget: new CursorWidget(label, user.color, isTyping), side: 1 })
+            .range(head)
         );
       }
 
-      if (widgets.length === 0) return Decoration.none;
-      widgets.sort((a, b) => a.from - b.from);
-      return Decoration.set(widgets);
+      if (decorations.length === 0) return Decoration.none;
+      // Decoration.set with `sort=true` handles both from and startSide
+      // ordering. Cheaper than the pre-sort for the small counts we render.
+      return Decoration.set(decorations, true);
     }
   }, { decorations: v => v.decorations });
 }

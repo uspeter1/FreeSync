@@ -30948,13 +30948,15 @@ var PresenceManager = class {
       const file = state.activeFile ?? null;
       if (file) {
         if (!fileUsers.has(file))
-          fileUsers.set(file, []);
-        fileUsers.get(file).push(user);
+          fileUsers.set(file, /* @__PURE__ */ new Map());
+        const byUser = fileUsers.get(file);
+        if (!byUser.has(user.id))
+          byUser.set(user.id, user);
       }
     }
     this.clearBadges();
-    for (const [filePath, users] of fileUsers) {
-      this.renderFileBadge(filePath, users);
+    for (const [filePath, byUser] of fileUsers) {
+      this.renderFileBadge(filePath, [...byUser.values()]);
     }
   }
   renderFileBadge(filePath, users) {
@@ -31268,7 +31270,7 @@ function remoteCursorsExtension(ref) {
         return import_view.Decoration.none;
       const docLen = view.state.doc.length;
       const now = Date.now();
-      const widgets = [];
+      const decorations = [];
       for (const [clientId, state] of ref.awareness.getStates()) {
         if (clientId === ref.localClientId)
           continue;
@@ -31277,16 +31279,27 @@ function remoteCursorsExtension(ref) {
         const activeFile = state?.activeFile;
         if (!user || !cursor || activeFile !== filePath)
           continue;
-        const pos = Math.min(Math.max(cursor.head, 0), docLen);
+        const head2 = Math.min(Math.max(cursor.head, 0), docLen);
+        const anchor = Math.min(Math.max(cursor.anchor, 0), docLen);
         const isTyping = cursor.updatedAt > 0 && now - cursor.updatedAt < 3e3;
-        widgets.push(
-          import_view.Decoration.widget({ widget: new CursorWidget(user.display_name, user.color, isTyping), side: 1 }).range(pos)
+        const isSelf = ref.localUserId != null && user.id === ref.localUserId;
+        const label = isSelf ? "You" : user.display_name;
+        if (head2 !== anchor) {
+          const from2 = Math.min(head2, anchor);
+          const to = Math.max(head2, anchor);
+          decorations.push(
+            import_view.Decoration.mark({
+              attributes: { style: `background-color: ${user.color}33;` }
+            }).range(from2, to)
+          );
+        }
+        decorations.push(
+          import_view.Decoration.widget({ widget: new CursorWidget(label, user.color, isTyping), side: 1 }).range(head2)
         );
       }
-      if (widgets.length === 0)
+      if (decorations.length === 0)
         return import_view.Decoration.none;
-      widgets.sort((a, b) => a.from - b.from);
-      return import_view.Decoration.set(widgets);
+      return import_view.Decoration.set(decorations, true);
     }
   }, { decorations: (v) => v.decorations });
 }
@@ -32023,6 +32036,7 @@ var DEFAULT_SETTINGS = {
   supabaseUrl: "https://awgcorggtvfcnmjdcljb.supabase.co",
   supabaseAnonKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF3Z2NvcmdndHZmY25tamRjbGpiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzgwMTIwNjAsImV4cCI6MjA5MzU4ODA2MH0.Ymb_EpVaNxPZa4M-dgCIbw2t6taY8YEjA8pw9Q8n3cI",
   relayUrl: "ws://localhost:3001/sync",
+  webAppUrl: "https://freesync.app",
   email: "",
   password: "",
   vaultId: "",
@@ -32032,7 +32046,7 @@ var FreeSyncPlugin = class extends import_obsidian6.Plugin {
   constructor() {
     super(...arguments);
     this.jwt = null;
-    this.awarenessRef = { awareness: null, localClientId: -1 };
+    this.awarenessRef = { awareness: null, localClientId: -1, localUserId: null };
     this.commentsRef = {
       getComments: null,
       localUser: null,
@@ -32189,6 +32203,7 @@ var FreeSyncPlugin = class extends import_obsidian6.Plugin {
         const aw = this.syncManager.manifestProvider.awareness;
         this.awarenessRef.awareness = aw;
         this.awarenessRef.localClientId = aw.clientID;
+        this.awarenessRef.localUserId = user.id;
       }
       this.commentsRef.getComments = (path) => this.syncManager.getComments(path);
       this.commentsRef.localUser = {
@@ -32226,6 +32241,7 @@ var FreeSyncPlugin = class extends import_obsidian6.Plugin {
   async stopSync() {
     this.jwt = null;
     this.awarenessRef.awareness = null;
+    this.awarenessRef.localUserId = null;
     this.commentsRef.getComments = null;
     this.commentsRef.localUser = null;
     this.commentsRef.focusComment = null;
@@ -32477,131 +32493,417 @@ var FreeSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
+    // Tab-local JWT used only during the sign-in → vault-picker phase (before
+    // the full plugin startSync() runs). Once a vault is picked and startSync
+    // succeeds, plugin.currentJwt is the source of truth.
+    this.tempJwt = null;
+    this.tempUserEmail = null;
   }
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "FreeSync Settings" });
-    const isEmpty2 = this.plugin.app.vault.getFiles().length === 0;
-    new import_obsidian6.Setting(containerEl).setName("Email").addText((t) => t.setValue(this.plugin.settings.email).onChange(async (v) => {
-      this.plugin.settings.email = v;
-      await this.plugin.saveSettings();
-    }));
-    new import_obsidian6.Setting(containerEl).setName("Password").addText((t) => {
+    containerEl.createEl("h2", { text: "FreeSync" });
+    if (this.plugin.settings.vaultId) {
+      this.renderConnected(containerEl);
+    } else if (this.tempJwt) {
+      void this.renderVaultPicker(containerEl);
+    } else {
+      this.renderSignIn(containerEl);
+    }
+    this.renderAdvanced(containerEl);
+  }
+  // ── State A: sign in ────────────────────────────────────────────────────
+  renderSignIn(el) {
+    el.createEl("h3", { text: "Sign in to FreeSync" });
+    let emailInput = "";
+    let passwordInput = "";
+    new import_obsidian6.Setting(el).setName("Email").addText((t) => {
+      t.inputEl.type = "email";
+      t.setValue(this.plugin.settings.email).onChange((v) => {
+        emailInput = v;
+      });
+      emailInput = t.getValue();
+    });
+    new import_obsidian6.Setting(el).setName("Password").addText((t) => {
       t.inputEl.type = "password";
-      t.setValue(this.plugin.settings.password).onChange(async (v) => {
-        this.plugin.settings.password = v;
-        await this.plugin.saveSettings();
+      t.setValue(this.plugin.settings.password).onChange((v) => {
+        passwordInput = v;
+      });
+      passwordInput = t.getValue();
+    });
+    const errorRow = el.createDiv({ cls: "freesync-settings-error" });
+    errorRow.style.cssText = "color:var(--text-error);margin:8px 0;min-height:1em;";
+    new import_obsidian6.Setting(el).addButton((b) => {
+      b.setButtonText("Sign in").setCta();
+      b.onClick(async () => {
+        errorRow.textContent = "";
+        b.setButtonText("Signing in\u2026").setDisabled(true);
+        const ok = await this.doSignIn(emailInput.trim(), passwordInput, errorRow);
+        if (ok)
+          this.display();
+        else
+          b.setButtonText("Sign in").setDisabled(false);
       });
     });
-    new import_obsidian6.Setting(containerEl).setName("Relay URL").addText((t) => t.setValue(this.plugin.settings.relayUrl).onChange(async (v) => {
+    const webApp = this.plugin.settings.webAppUrl.replace(/\/+$/, "");
+    const linkRow = el.createDiv();
+    linkRow.style.cssText = "font-size:12px;color:var(--text-muted);margin-top:8px;";
+    linkRow.createSpan({ text: "New here? " });
+    const link = linkRow.createEl("a", {
+      text: `Create your account at ${webApp.replace(/^https?:\/\//, "")}`,
+      href: `${webApp}/auth/signup`
+    });
+    link.setAttr("target", "_blank");
+  }
+  // Sign-in helper shared by State A and used before showing picker.
+  // Returns true on success (tempJwt populated, settings saved).
+  async doSignIn(email, password, errorEl) {
+    if (!email || !password) {
+      errorEl.textContent = "Enter email and password.";
+      return false;
+    }
+    try {
+      const supabase = createClient(
+        this.plugin.settings.supabaseUrl,
+        this.plugin.settings.supabaseAnonKey,
+        { auth: { persistSession: false, autoRefreshToken: false } }
+      );
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error || !data.session) {
+        errorEl.textContent = error?.message ?? "Sign in failed";
+        return false;
+      }
+      this.tempJwt = data.session.access_token;
+      this.tempUserEmail = email;
+      this.plugin.settings.email = email;
+      this.plugin.settings.password = password;
+      await this.plugin.saveSettings();
+      await this.trySmartVaultSelect();
+      return true;
+    } catch (e) {
+      errorEl.textContent = `Sign in error: ${e instanceof Error ? e.message : String(e)}`;
+      return false;
+    }
+  }
+  // Auto-select a FreeSync vault on sign-in when the Obsidian vault has
+  // real files (i.e., isn't a fresh empty vault). Matches by name against
+  // the user's existing active vaults first — this prevents accidental
+  // duplicates when the user signs out and back in on the same vault.
+  async trySmartVaultSelect() {
+    const untitledRe = /^Untitled(\s+\d+)?$/i;
+    const localFiles = this.plugin.app.vault.getFiles().filter((f) => !untitledRe.test(f.basename));
+    if (localFiles.length === 0)
+      return;
+    const vaultName = this.plugin.app.vault.getName();
+    if (!vaultName)
+      return;
+    try {
+      const listRes = await (0, import_obsidian6.requestUrl)({
+        url: `${this.plugin.getRelayHttpBase()}/vaults`,
+        headers: { Authorization: `Bearer ${this.tempJwt}` },
+        throw: false
+      });
+      if (listRes.status !== 200)
+        return;
+      const vaults = listRes.json;
+      const existing = vaults.find(
+        (v) => v.name.toLowerCase() === vaultName.toLowerCase() && v.vault_members?.[0]?.status === "active"
+      );
+      if (existing) {
+        await this.attachToVault(existing.id, `Connected to existing vault "${existing.name}"`);
+        return;
+      }
+      const createRes = await (0, import_obsidian6.requestUrl)({
+        url: `${this.plugin.getRelayHttpBase()}/vaults`,
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.tempJwt}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ name: vaultName }),
+        throw: false
+      });
+      if (createRes.status !== 200 && createRes.status !== 201)
+        return;
+      await this.attachToVault(createRes.json.id, `Created FreeSync vault "${vaultName}"`);
+    } catch {
+    }
+  }
+  async attachToVault(vaultId, noticeText) {
+    this.plugin.settings.vaultId = vaultId;
+    this.plugin.settings.enabled = true;
+    await this.plugin.saveSettings();
+    try {
+      await this.plugin.startSync();
+    } catch {
+    }
+    new import_obsidian6.Notice(`FreeSync: ${noticeText}`);
+  }
+  // ── State B: pick / create / join a vault ───────────────────────────────
+  async renderVaultPicker(el) {
+    const header = el.createDiv();
+    header.style.cssText = "display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;";
+    header.createEl("span", { text: `Signed in as ${this.tempUserEmail ?? this.plugin.settings.email}` }).style.cssText = "font-weight:600;";
+    const signOutLink = header.createEl("a", { text: "Sign out", href: "#" });
+    signOutLink.style.cssText = "font-size:12px;color:var(--text-muted);";
+    signOutLink.addEventListener("click", async (e) => {
+      e.preventDefault();
+      await this.doSignOut();
+    });
+    const loading = el.createEl("p", { text: "Loading your vaults\u2026", cls: "setting-item-description" });
+    let vaults = [];
+    try {
+      const res = await (0, import_obsidian6.requestUrl)({
+        url: `${this.plugin.getRelayHttpBase()}/vaults`,
+        headers: { Authorization: `Bearer ${this.tempJwt}` },
+        throw: false
+      });
+      if (res.status !== 200) {
+        loading.textContent = `Couldn't load your vaults (${res.status}): ${res.json?.error ?? "relay error"}`;
+        return;
+      }
+      vaults = res.json;
+    } catch (e) {
+      loading.textContent = `Couldn't reach the relay: ${e instanceof Error ? e.message : String(e)}`;
+      return;
+    }
+    loading.remove();
+    const activeVaults = vaults.filter((v) => v.vault_members?.[0]?.status === "active");
+    const invitedVaults = vaults.filter((v) => v.vault_members?.[0]?.status === "invited");
+    if (activeVaults.length > 0) {
+      el.createEl("h3", { text: "Your vaults" });
+      const list = el.createEl("div", { cls: "freesync-vault-list" });
+      list.style.cssText = "display:flex;flex-direction:column;gap:6px;margin-bottom:20px;";
+      for (const v of activeVaults) {
+        const row = list.createEl("button", { cls: "freesync-vault-row" });
+        row.style.cssText = "display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:var(--background-secondary);border:1px solid var(--background-modifier-border);border-radius:6px;cursor:pointer;text-align:left;";
+        const nameEl = row.createEl("span", { text: v.name });
+        nameEl.style.cssText = "font-weight:500;";
+        row.createEl("span", {
+          text: `${v.active_member_count ?? 1} member${(v.active_member_count ?? 1) === 1 ? "" : "s"}`
+        }).style.cssText = "font-size:12px;color:var(--text-muted);";
+        row.addEventListener("click", () => void this.pickExistingVault(v.id));
+      }
+    }
+    if (invitedVaults.length > 0) {
+      const callout = el.createDiv();
+      callout.style.cssText = "padding:10px 12px;margin-bottom:20px;background:var(--background-modifier-hover);border-left:3px solid var(--interactive-accent);border-radius:4px;font-size:13px;";
+      callout.createEl("div", {
+        text: `You have ${invitedVaults.length} pending invitation${invitedVaults.length === 1 ? "" : "s"}: ${invitedVaults.map((v) => v.name).join(", ")}.`
+      });
+      const webApp = this.plugin.settings.webAppUrl.replace(/\/+$/, "");
+      const linkLine = callout.createEl("div");
+      linkLine.style.cssText = "margin-top:4px;color:var(--text-muted);";
+      linkLine.createSpan({ text: "Accept them in the " });
+      const a = linkLine.createEl("a", { text: "web dashboard", href: `${webApp}/dashboard` });
+      a.setAttr("target", "_blank");
+      linkLine.createSpan({ text: ", then reload this settings tab." });
+    }
+    el.createEl("h3", { text: "Create a new vault" });
+    let newName = "";
+    const createRow = el.createDiv();
+    createRow.style.cssText = "display:flex;gap:8px;margin-bottom:20px;";
+    const nameInput = createRow.createEl("input");
+    nameInput.type = "text";
+    nameInput.placeholder = "Vault name";
+    nameInput.style.cssText = "flex:1;padding:6px 10px;";
+    nameInput.addEventListener("input", () => {
+      newName = nameInput.value.trim();
+    });
+    const createBtn = createRow.createEl("button", { text: "Create", cls: "mod-cta" });
+    createBtn.addEventListener("click", () => void this.createVault(newName, createBtn));
+    el.createEl("h3", { text: "Join by invite code" });
+    let code = "";
+    const joinRow = el.createDiv();
+    joinRow.style.cssText = "display:flex;gap:8px;margin-bottom:20px;";
+    const codeInput = joinRow.createEl("input");
+    codeInput.type = "text";
+    codeInput.placeholder = "vaultId/inviteCode";
+    codeInput.style.cssText = "flex:1;padding:6px 10px;font-family:monospace;";
+    codeInput.addEventListener("input", () => {
+      code = codeInput.value.trim();
+    });
+    const joinBtn = joinRow.createEl("button", { text: "Join", cls: "mod-cta" });
+    joinBtn.addEventListener("click", () => void this.joinVault(code, joinBtn));
+  }
+  async pickExistingVault(vaultId) {
+    this.plugin.settings.vaultId = vaultId;
+    this.plugin.settings.enabled = true;
+    await this.plugin.saveSettings();
+    try {
+      await this.plugin.startSync();
+    } catch (e) {
+      new import_obsidian6.Notice(`Sync failed: ${e}`);
+    }
+    this.tempJwt = null;
+    this.tempUserEmail = null;
+    this.display();
+  }
+  async createVault(name, btn) {
+    if (!name) {
+      new import_obsidian6.Notice("Enter a vault name");
+      return;
+    }
+    btn.textContent = "Creating\u2026";
+    btn.disabled = true;
+    try {
+      const res = await (0, import_obsidian6.requestUrl)({
+        url: `${this.plugin.getRelayHttpBase()}/vaults`,
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.tempJwt}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+        throw: false
+      });
+      if (res.status !== 201 && res.status !== 200) {
+        new import_obsidian6.Notice(`Create failed: ${res.json?.error ?? res.status}`);
+        btn.textContent = "Create";
+        btn.disabled = false;
+        return;
+      }
+      await this.pickExistingVault(res.json.id);
+    } catch (e) {
+      new import_obsidian6.Notice(`Create error: ${e instanceof Error ? e.message : String(e)}`);
+      btn.textContent = "Create";
+      btn.disabled = false;
+    }
+  }
+  async joinVault(code, btn) {
+    if (!code) {
+      new import_obsidian6.Notice("Paste an invite code");
+      return;
+    }
+    const slash = code.indexOf("/");
+    if (slash < 1) {
+      new import_obsidian6.Notice("Invalid code \u2014 expected vaultId/inviteCode");
+      return;
+    }
+    const vaultId = code.slice(0, slash);
+    const inviteCode = code.slice(slash + 1);
+    btn.textContent = "Joining\u2026";
+    btn.disabled = true;
+    try {
+      const res = await (0, import_obsidian6.requestUrl)({
+        url: `${this.plugin.getRelayHttpBase()}/vaults/${vaultId}/join`,
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.tempJwt}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ invite_code: inviteCode }),
+        throw: false
+      });
+      if (res.status !== 200) {
+        new import_obsidian6.Notice(`Join failed: ${res.json?.error ?? res.status}`);
+        btn.textContent = "Join";
+        btn.disabled = false;
+        return;
+      }
+      await this.pickExistingVault(vaultId);
+    } catch (e) {
+      new import_obsidian6.Notice(`Join error: ${e instanceof Error ? e.message : String(e)}`);
+      btn.textContent = "Join";
+      btn.disabled = false;
+    }
+  }
+  // ── State C: connected ──────────────────────────────────────────────────
+  renderConnected(el) {
+    const status = el.createDiv();
+    status.style.cssText = "padding:12px 14px;background:var(--background-secondary);border-radius:6px;margin-bottom:16px;";
+    const statusLine = status.createEl("div");
+    statusLine.style.cssText = "font-weight:600;margin-bottom:2px;";
+    const jwtOK = !!this.plugin.currentJwt;
+    statusLine.textContent = jwtOK ? `\u2713 Connected as ${this.plugin.settings.email}` : `Configured \u2014 sync is paused`;
+    const vaultLine = status.createEl("div");
+    vaultLine.style.cssText = "font-size:12px;color:var(--text-muted);";
+    vaultLine.textContent = `Vault ID: ${this.plugin.settings.vaultId.slice(0, 8)}\u2026`;
+    if (jwtOK)
+      void this.fillVaultName(vaultLine);
+    const actionRow = status.createDiv();
+    actionRow.style.cssText = "display:flex;gap:12px;margin-top:8px;font-size:12px;";
+    const signOutLink = actionRow.createEl("a", { text: "Sign out", href: "#" });
+    signOutLink.addEventListener("click", async (e) => {
+      e.preventDefault();
+      await this.doSignOut();
+    });
+    new import_obsidian6.Setting(el).setName("Enable sync").addToggle((t) => t.setValue(this.plugin.settings.enabled).onChange(async (v) => {
+      this.plugin.settings.enabled = v;
+      await this.plugin.saveSettings();
+      if (v)
+        await this.plugin.startSync();
+      else
+        await this.plugin.stopSync();
+      this.display();
+    }));
+    el.createEl("h3", { text: "Share vault", cls: "freesync-settings-section" });
+    const shareArea = el.createDiv({ cls: "freesync-share-area" });
+    if (this.plugin.currentJwt) {
+      this.renderShareCode(shareArea);
+    } else {
+      shareArea.createEl("p", {
+        text: "Enable sync above to see your invite code.",
+        cls: "freesync-share-desc"
+      });
+    }
+  }
+  async fillVaultName(vaultLine) {
+    try {
+      const res = await (0, import_obsidian6.requestUrl)({
+        url: `${this.plugin.getRelayHttpBase()}/vaults`,
+        headers: { Authorization: `Bearer ${this.plugin.currentJwt}` },
+        throw: false
+      });
+      if (res.status !== 200)
+        return;
+      const vaults = res.json;
+      const v = vaults.find((x) => x.id === this.plugin.settings.vaultId);
+      if (v)
+        vaultLine.textContent = `${v.name} \xB7 ${v.active_member_count ?? 1} member${(v.active_member_count ?? 1) === 1 ? "" : "s"}`;
+    } catch {
+    }
+  }
+  async doSignOut() {
+    await this.plugin.stopSync();
+    this.plugin.settings.email = "";
+    this.plugin.settings.password = "";
+    this.plugin.settings.vaultId = "";
+    this.plugin.settings.enabled = false;
+    await this.plugin.saveSettings();
+    this.tempJwt = null;
+    this.tempUserEmail = null;
+    this.display();
+    new import_obsidian6.Notice("Signed out of FreeSync.");
+  }
+  // ── Advanced / self-hosting ─────────────────────────────────────────────
+  renderAdvanced(el) {
+    const details = el.createEl("details");
+    details.style.cssText = "margin-top:24px;padding:10px 14px;background:var(--background-secondary);border-radius:6px;";
+    const summary = details.createEl("summary", { text: "Advanced (self-hosting)" });
+    summary.style.cssText = "cursor:pointer;color:var(--text-muted);font-size:13px;";
+    const note = details.createEl("p", {
+      text: "These defaults use FreeSync Cloud. Only change if you're running your own Supabase project and relay server.",
+      cls: "setting-item-description"
+    });
+    note.style.cssText = "margin:8px 0 12px;";
+    new import_obsidian6.Setting(details).setName("Supabase URL").addText((t) => t.setValue(this.plugin.settings.supabaseUrl).onChange(async (v) => {
+      this.plugin.settings.supabaseUrl = v;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian6.Setting(details).setName("Supabase anon key").addText((t) => t.setValue(this.plugin.settings.supabaseAnonKey).onChange(async (v) => {
+      this.plugin.settings.supabaseAnonKey = v;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian6.Setting(details).setName("Relay URL").addText((t) => t.setValue(this.plugin.settings.relayUrl).onChange(async (v) => {
       this.plugin.settings.relayUrl = v;
       await this.plugin.saveSettings();
     }));
-    if (isEmpty2) {
-      containerEl.createEl("h3", { text: "Join a Shared Vault", cls: "freesync-settings-section" });
-      containerEl.createEl("p", {
-        text: "Paste an invite code from a vault owner. All their files will sync to your vault automatically.",
-        cls: "setting-item-description"
-      });
-      let joinCode = "";
-      const joinRow = containerEl.createDiv({ cls: "freesync-join-row" });
-      const joinInput = joinRow.createEl("input", { cls: "freesync-share-input" });
-      joinInput.placeholder = "Paste invite code here";
-      joinInput.addEventListener("input", () => {
-        joinCode = joinInput.value.trim();
-      });
-      const joinBtn = joinRow.createEl("button", { text: "Join Vault", cls: "mod-cta freesync-share-btn" });
-      joinBtn.addEventListener("click", async () => {
-        if (!joinCode) {
-          new import_obsidian6.Notice("Paste an invite code first");
-          return;
-        }
-        const slashIdx = joinCode.indexOf("/");
-        if (slashIdx < 1) {
-          new import_obsidian6.Notice("Invalid invite code \u2014 expected vaultId/inviteCode");
-          return;
-        }
-        const vaultId = joinCode.slice(0, slashIdx);
-        const inviteCode = joinCode.slice(slashIdx + 1);
-        if (!this.plugin.settings.email || !this.plugin.settings.password) {
-          new import_obsidian6.Notice("Enter email and password above first");
-          return;
-        }
-        joinBtn.textContent = "Joining\u2026";
-        joinBtn.disabled = true;
-        try {
-          const supabase = createClient(
-            this.plugin.settings.supabaseUrl,
-            this.plugin.settings.supabaseAnonKey,
-            { auth: { persistSession: false, autoRefreshToken: false } }
-          );
-          const { data, error } = await supabase.auth.signInWithPassword({
-            email: this.plugin.settings.email,
-            password: this.plugin.settings.password
-          });
-          if (error || !data.session) {
-            new import_obsidian6.Notice(`Sign in failed: ${error?.message}`);
-            joinBtn.textContent = "Join Vault";
-            joinBtn.disabled = false;
-            return;
-          }
-          const token = data.session.access_token;
-          const relayBase = this.plugin.getRelayHttpBase();
-          const res = await (0, import_obsidian6.requestUrl)({
-            url: `${relayBase}/vaults/${vaultId}/join`,
-            method: "POST",
-            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ invite_code: inviteCode }),
-            throw: false
-          });
-          const json = res.json;
-          if (res.status !== 200) {
-            new import_obsidian6.Notice(`Failed to join: ${json.error}`);
-            joinBtn.textContent = "Join Vault";
-            joinBtn.disabled = false;
-            return;
-          }
-          this.plugin.settings.vaultId = vaultId;
-          this.plugin.settings.enabled = true;
-          await this.plugin.saveSettings();
-          await this.plugin.startSync();
-          joinBtn.textContent = "\u2713 Joined";
-          new import_obsidian6.Notice("Joined! Files are syncing to your vault\u2026");
-        } catch (e) {
-          new import_obsidian6.Notice(`Error: ${e}`);
-          joinBtn.textContent = "Join Vault";
-          joinBtn.disabled = false;
-        }
-      });
-    } else {
-      new import_obsidian6.Setting(containerEl).setName("Vault ID").setDesc("UUID from FreeSync vault").addText((t) => t.setValue(this.plugin.settings.vaultId).onChange(async (v) => {
-        this.plugin.settings.vaultId = v;
+    new import_obsidian6.Setting(details).setName("Web app URL").setDesc("Used for sign-up and dashboard links.").addText((t) => t.setValue(this.plugin.settings.webAppUrl).onChange(async (v) => {
+      this.plugin.settings.webAppUrl = v;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian6.Setting(details).addButton((b) => {
+      b.setButtonText("Reset to FreeSync Cloud defaults").onClick(async () => {
+        this.plugin.settings.supabaseUrl = DEFAULT_SETTINGS.supabaseUrl;
+        this.plugin.settings.supabaseAnonKey = DEFAULT_SETTINGS.supabaseAnonKey;
+        this.plugin.settings.relayUrl = DEFAULT_SETTINGS.relayUrl;
+        this.plugin.settings.webAppUrl = DEFAULT_SETTINGS.webAppUrl;
         await this.plugin.saveSettings();
-      }));
-      new import_obsidian6.Setting(containerEl).setName("Enable Sync").addToggle((t) => t.setValue(this.plugin.settings.enabled).onChange(async (v) => {
-        this.plugin.settings.enabled = v;
-        await this.plugin.saveSettings();
-        if (v)
-          await this.plugin.startSync();
-        else
-          await this.plugin.stopSync();
-      }));
-      containerEl.createEl("h3", { text: "Share Vault", cls: "freesync-settings-section" });
-      containerEl.createEl("p", {
-        text: "Share your vault with collaborators. They paste the code in a fresh Obsidian vault.",
-        cls: "setting-item-description"
+        this.display();
       });
-      const shareArea = containerEl.createDiv({ cls: "freesync-share-area" });
-      if (this.plugin.currentJwt) {
-        this.renderShareCode(shareArea);
-      } else {
-        shareArea.createEl("p", {
-          text: "Enable sync above to see your invite code.",
-          cls: "freesync-share-desc"
-        });
-      }
-    }
+    });
   }
   async renderShareCode(container) {
     const loading = container.createEl("p", { text: "Loading invite code\u2026", cls: "freesync-share-desc" });
