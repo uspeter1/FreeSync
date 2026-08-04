@@ -125,4 +125,4 @@ Not yet declared. Treat as **all-rights-reserved** until a `LICENSE` file appear
 
 ## Contributing
 
-FreeSync is not currently accepting outside PRs — the API surface and schema are still churning. Issues and reproductions are welcome (there are templates under `.github/ISSUE_TEMPLATE/`).
+Pull requests are welcome — anyone can open one, I'll review and merge. Bug reports, feature ideas, docs fixes, and tests are all fair game. See [CONTRIBUTING.md](CONTRIBUTING.md) for the details and [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/) for issue templates.
