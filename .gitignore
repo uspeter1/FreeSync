@@ -27,3 +27,4 @@ packages/web/.next/
 .playwright-mcp/
 page-current.png
 page-*.png
+*.tsbuildinfo

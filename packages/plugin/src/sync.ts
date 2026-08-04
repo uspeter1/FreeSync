@@ -57,6 +57,11 @@ export interface SyncSettings {
   displayName: string;
   color: string;
   supabase: SupabaseClient;
+  // Explicit URL + anon key for direct fetch calls to Supabase Storage —
+  // reading them off the SupabaseClient via as-any casts is unreliable
+  // (private props, minified in prod builds).
+  supabaseUrl: string;
+  supabaseAnonKey: string;
 }
 
 // Shape stored per file in the manifest Y.Map
@@ -408,10 +413,41 @@ export class SyncManager {
     const storageKey = `${this.settings.vaultId}/${file.path}`;
     try {
       const buffer = await this.app.vault.readBinary(file);
-      const { error } = await this.settings.supabase.storage
-        .from(STORAGE_BUCKET)
-        .upload(storageKey, buffer, { upsert: true, contentType: contentType(file.path) });
-      if (error) { console.error('[FreeSync] Storage upload failed:', error.message); return; }
+      // Direct fetch to the Storage REST API. Bypasses supabase-js's Storage
+      // client, which in our setup doesn't attach the session JWT to upload
+      // requests — Storage sees only the anon key, RLS then denies as
+      // "new row violates row-level security policy" even though the current
+      // session is a valid vault member. Verified 2026-07-29 that pure fetch
+      // with `Authorization: Bearer <access_token>` succeeds where the JS
+      // client fails.
+      const session = (await this.settings.supabase.auth.getSession()).data.session;
+      if (!session?.access_token) {
+        console.error('[FreeSync] Storage upload: no session'); return;
+      }
+      // URL-encode each path segment (Supabase Storage requires spaces etc.
+      // encoded — sending literal spaces trips a 400/403 depending on how
+      // the intermediate proxies interpret the URL).
+      const encodedPath = storageKey.split('/').map(encodeURIComponent).join('/');
+      // Upsert as a QUERY PARAM (`?upsert=true`), NOT the `x-upsert` header.
+      // The header form triggers an RLS-eval code path in Storage that always
+      // returns "new row violates row-level security policy" for us, even on
+      // a fresh insert where no existing row could conflict. Verified
+      // 2026-07-29: identical fetch with `?upsert=true` succeeds where
+      // `x-upsert: true` fails.
+      const url = `${this.settings.supabaseUrl}/storage/v1/object/${STORAGE_BUCKET}/${encodedPath}?upsert=true`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'apikey':        this.settings.supabaseAnonKey,
+          'Authorization': `Bearer ${session.access_token}`,
+          'Content-Type':  contentType(file.path),
+        },
+        body: new Uint8Array(buffer),
+      });
+      if (!res.ok) {
+        console.error('[FreeSync] Storage upload failed:', res.status, await res.text().catch(() => ''));
+        return;
+      }
       this.recentlyUploaded.add(storageKey);
       setTimeout(() => this.recentlyUploaded.delete(storageKey), 10_000);
       const fileMap = this.manifestDoc?.getMap<FileEntry>('files');
@@ -634,6 +670,17 @@ export class SyncManager {
       if (clearPresenceTimer) clearTimeout(clearPresenceTimer);
       this.app.workspace.off('file-open', onFileOpen);
     });
+
+    // Canvas view navigation doesn't reliably fire 'file-open', so a user
+    // leaving a canvas leaves their presence badge stuck on it. Mirror any
+    // active-leaf-change into presence too — cheap, and the setActiveFile
+    // call is idempotent for repeat file paths.
+    const onLeafChange = () => {
+      const activeFile = this.app.workspace.getActiveFile();
+      this.presence.setActiveFile(activeFile?.path ?? null);
+    };
+    this.app.workspace.on('active-leaf-change', onLeafChange);
+    this.unsubscribers.push(() => this.app.workspace.off('active-leaf-change', onLeafChange));
   }
 
   stop() {

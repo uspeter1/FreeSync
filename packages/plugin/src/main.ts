@@ -4,12 +4,17 @@ import { SyncManager } from './sync';
 import { PresenceManager } from './presence';
 import { FreeSyncSidebarView, VIEW_TYPE_FREESYNC } from './sidebar';
 import { AwarenessRef, remoteCursorsExtension, publishCursorExtension } from './cursors';
+import { remoteEditPulseExtension } from './remote-edit-pulse';
+import { CanvasCursorManager } from './canvas-cursors';
+import { renderShareUI } from './share';
 import { CommentsRef, commentsExtension } from './comments';
 import { CommentsPanelView, VIEW_TYPE_COMMENTS } from './comments-panel';
 
 // Injected by esbuild at build time (see packages/plugin/esbuild.config.mjs).
-// Override with `WEB_APP_URL=https://your-host.example npm run build`.
+// Set in packages/plugin/.env or override inline:
+//   WEB_APP_URL=... RELAY_URL=... npm run build --workspace=packages/plugin
 declare const __WEB_APP_URL__: string;
+declare const __RELAY_URL__: string;
 
 interface FreeSyncSettings {
   supabaseUrl: string;
@@ -25,7 +30,7 @@ interface FreeSyncSettings {
 const DEFAULT_SETTINGS: FreeSyncSettings = {
   supabaseUrl: 'https://awgcorggtvfcnmjdcljb.supabase.co',
   supabaseAnonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF3Z2NvcmdndHZmY25tamRjbGpiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzgwMTIwNjAsImV4cCI6MjA5MzU4ODA2MH0.Ymb_EpVaNxPZa4M-dgCIbw2t6taY8YEjA8pw9Q8n3cI',
-  relayUrl: 'ws://localhost:3001/sync',
+  relayUrl: __RELAY_URL__,
   webAppUrl: __WEB_APP_URL__,
   email: '',
   password: '',
@@ -42,6 +47,7 @@ export default class FreeSyncPlugin extends Plugin {
   private jwt: string | null = null;
   get currentJwt(): string | null { return this.jwt; }
   private awarenessRef: AwarenessRef = { awareness: null, localClientId: -1, localUserId: null };
+  private canvasCursors!: CanvasCursorManager;
   private commentsRef: CommentsRef = {
     getComments: null,
     localUser: null,
@@ -58,7 +64,12 @@ export default class FreeSyncPlugin extends Plugin {
     await this.loadSettings();
 
     this.supabase = createClient(this.settings.supabaseUrl, this.settings.supabaseAnonKey, {
-      auth: { persistSession: false, autoRefreshToken: false },
+      // persistSession stays false — that's what prevents Electron-vault
+      // session bleed via localStorage. autoRefreshToken is safe because
+      // it only refreshes the in-memory session; without it, the plugin's
+      // JWT expires ~1h after sign-in and every subsequent Supabase call
+      // (Storage uploads especially) starts silently 401ing.
+      auth: { persistSession: false, autoRefreshToken: true },
     });
     this.presenceManager = new PresenceManager(this.app);
     this.syncManager = new SyncManager(this.app, this.presenceManager);
@@ -82,7 +93,7 @@ export default class FreeSyncPlugin extends Plugin {
     // Ribbon icon to share vault
     this.addRibbonIcon('share-2', 'FreeSync — share vault', () => {
       if (!this.jwt) { new Notice('FreeSync: Connect first to share'); return; }
-      new FreeSyncShareModal(this.app, this.settings.vaultId, this.jwt, this.getRelayHttpBase()).open();
+      new FreeSyncShareModal(this.app, this).open();
     });
 
     this.addCommand({
@@ -90,13 +101,20 @@ export default class FreeSyncPlugin extends Plugin {
       name: 'Share vault',
       callback: () => {
         if (!this.jwt) { new Notice('FreeSync: Connect first to share'); return; }
-        new FreeSyncShareModal(this.app, this.settings.vaultId, this.jwt, this.getRelayHttpBase()).open();
+        new FreeSyncShareModal(this.app, this).open();
       },
     });
 
     // Register CM6 cursor extensions (awareness ref is populated after startSync)
     this.registerEditorExtension(remoteCursorsExtension(this.awarenessRef));
     this.registerEditorExtension(publishCursorExtension(this.awarenessRef));
+
+    // Brief fade highlight on ranges that arrived from other collaborators —
+    // makes batched remote inserts feel like live typing.
+    this.registerEditorExtension(remoteEditPulseExtension());
+
+    // Canvas cursor overlay — started once awareness is wired in startSync().
+    this.canvasCursors = new CanvasCursorManager(this.app, this.awarenessRef);
 
     // Register CM6 comments extensions (commentsRef is populated after startSync)
     this.registerEditorExtension(commentsExtension(this.commentsRef));
@@ -209,6 +227,8 @@ export default class FreeSyncPlugin extends Plugin {
         displayName: profile?.display_name ?? user.email ?? 'Unknown',
         color: profile?.color ?? '#7c5cfc',
         supabase: this.supabase,
+        supabaseUrl: this.settings.supabaseUrl,
+        supabaseAnonKey: this.settings.supabaseAnonKey,
       });
 
       // Wire status bar — shows last editor of the active file; click opens version history
@@ -229,6 +249,9 @@ export default class FreeSyncPlugin extends Plugin {
         this.awarenessRef.localClientId = aw.clientID;
         this.awarenessRef.localUserId = user.id;
       }
+
+      // Start canvas cursor overlay now that awareness is wired
+      this.canvasCursors.start();
 
       // Wire commentsRef for CM6 comments extensions
       this.commentsRef.getComments = (path) => this.syncManager.getComments(path);
@@ -273,6 +296,7 @@ export default class FreeSyncPlugin extends Plugin {
 
   async stopSync() {
     this.jwt = null;
+    this.canvasCursors?.stop();
     this.awarenessRef.awareness = null;
     this.awarenessRef.localUserId = null;
     this.commentsRef.getComments = null;
@@ -299,6 +323,7 @@ export default class FreeSyncPlugin extends Plugin {
   }
 
   onunload() {
+    this.canvasCursors?.stop();
     this.syncManager?.stop();
   }
 }
@@ -382,191 +407,21 @@ class FreeSyncHistoryModal extends Modal {
 }
 
 // ── Share Modal ───────────────────────────────────────────────────────────────
+// Thin wrapper around renderShareUI (share.ts). Shared behavior with the
+// inline settings-tab share section.
 
 class FreeSyncShareModal extends Modal {
-  constructor(
-    app: App,
-    private vaultId: string,
-    private jwt: string,
-    private relayBase: string,
-  ) {
+  constructor(app: App, private plugin: FreeSyncPlugin) {
     super(app);
   }
 
-  async onOpen() {
+  onOpen() {
     const { contentEl, modalEl } = this;
     modalEl.style.width = '520px';
     modalEl.style.maxWidth = '92vw';
     contentEl.empty();
-    contentEl.createEl('h3', { text: 'Share Vault', cls: 'freesync-share-title' });
-
-    const loading = contentEl.createEl('p', { text: 'Loading invite code…', cls: 'freesync-share-desc' });
-
-    try {
-      const res = await requestUrl({
-        url: `${this.relayBase}/vaults`,
-        headers: { Authorization: `Bearer ${this.jwt}` },
-        throw: false,
-      });
-      if (res.status !== 200) { loading.textContent = `Error ${res.status}: ${res.json?.error ?? 'relay error'}`; return; }
-      const vaults: Array<{ id: string; invite_code: string; name: string; open_invite: boolean }> = res.json;
-      const vault = vaults.find(v => v.id === this.vaultId);
-      if (!vault) { loading.textContent = 'Vault not found. Make sure you are connected.'; return; }
-      loading.remove();
-      this.renderContent(vault.name, vault.invite_code, vault.open_invite ?? false);
-    } catch (e) {
-      loading.textContent = `Failed to load vault info: ${e instanceof Error ? e.message : String(e)}`;
-    }
-  }
-
-  private renderContent(vaultName: string, inviteCode: string, openInvite: boolean) {
-    const { contentEl } = this;
-    const shareCode = `${this.vaultId}/${inviteCode}`;
-
-    // ── Mode selector tabs ────────────────────────────────────────────
-    const modeRow = contentEl.createDiv();
-    modeRow.style.cssText = 'display:flex;gap:8px;margin-bottom:16px;';
-
-    const makeTab = (label: string) => {
-      const btn = modeRow.createEl('button', { text: label });
-      btn.style.cssText = 'flex:1;padding:8px 12px;border-radius:6px;border:1px solid var(--background-modifier-border);cursor:pointer;font-size:13px;transition:all 0.12s;';
-      return btn;
-    };
-    const codeTab = makeTab('Anyone with the code');
-    const emailTab = makeTab('Specific people');
-    const codePanel = contentEl.createDiv();
-    const emailPanel = contentEl.createDiv();
-
-    const activateTab = (mode: 'code' | 'email') => {
-      const isCode = mode === 'code';
-      codePanel.style.display = isCode ? '' : 'none';
-      emailPanel.style.display = isCode ? 'none' : '';
-      codeTab.style.cssText += isCode
-        ? ';background:var(--interactive-accent);color:#fff;border-color:var(--interactive-accent);'
-        : ';background:;color:;border-color:var(--background-modifier-border);';
-      emailTab.style.cssText += isCode
-        ? ';background:;color:;border-color:var(--background-modifier-border);'
-        : ';background:var(--interactive-accent);color:#fff;border-color:var(--interactive-accent);';
-    };
-    codeTab.addEventListener('click', () => activateTab('code'));
-    emailTab.addEventListener('click', () => activateTab('email'));
-
-    // ── "Anyone with the code" panel ──────────────────────────────────
-    let currentOpenInvite = openInvite;
-
-    const toggleRow = codePanel.createDiv();
-    toggleRow.style.cssText = 'display:flex;align-items:center;gap:10px;margin-bottom:12px;';
-
-    const toggleLabel = toggleRow.createEl('span');
-    toggleLabel.style.cssText = 'flex:1;font-size:13px;';
-
-    const toggleBtn = toggleRow.createEl('button');
-    toggleBtn.style.cssText = 'padding:4px 14px;border-radius:12px;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all 0.12s;';
-
-    const codeDesc = codePanel.createEl('p', { cls: 'freesync-share-desc' });
-
-    const codeRow = codePanel.createDiv({ cls: 'freesync-share-row' });
-    codeRow.style.marginTop = '8px';
-    const codeInput = codeRow.createEl('input', { cls: 'freesync-share-input' });
-    codeInput.value = shareCode;
-    codeInput.readOnly = true;
-    codeInput.addEventListener('click', () => { if (currentOpenInvite) codeInput.select(); });
-
-    const copyBtn = codeRow.createEl('button', { text: 'Copy', cls: 'mod-cta freesync-share-btn' });
-    const toggleStatus = codePanel.createEl('p', { cls: 'freesync-share-desc' });
-    toggleStatus.style.marginTop = '6px';
-
-    const applyOpenInviteState = (enabled: boolean) => {
-      currentOpenInvite = enabled;
-      toggleLabel.textContent = enabled ? 'Anyone with the code can join' : 'Only people you invite can join';
-      toggleBtn.textContent = enabled ? 'Enabled' : 'Enable code sharing';
-      toggleBtn.style.background = enabled ? 'var(--interactive-accent)' : 'var(--background-modifier-border)';
-      toggleBtn.style.color = enabled ? '#fff' : 'var(--text-muted)';
-      codeDesc.textContent = enabled
-        ? 'Anyone who pastes this code in FreeSync can join. You can disable this at any time.'
-        : 'Code joining is off. Only people you add by email can join.';
-      codeInput.style.opacity = enabled ? '1' : '0.4';
-      (copyBtn as HTMLButtonElement).disabled = !enabled;
-      copyBtn.style.opacity = enabled ? '1' : '0.4';
-    };
-
-    applyOpenInviteState(openInvite);
-
-    toggleBtn.addEventListener('click', async () => {
-      const next = !currentOpenInvite;
-      (toggleBtn as HTMLButtonElement).disabled = true;
-      toggleStatus.textContent = '';
-      try {
-        const res = await requestUrl({
-          url: `${this.relayBase}/vaults/${this.vaultId}/open-invite`,
-          method: 'PATCH',
-          headers: { Authorization: `Bearer ${this.jwt}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ enabled: next }),
-          throw: false,
-        });
-        if (res.status === 200) {
-          applyOpenInviteState(next);
-        } else {
-          toggleStatus.textContent = `Error: ${res.json?.error ?? 'Unknown error'}`;
-        }
-      } catch (e) {
-        toggleStatus.textContent = `Failed: ${e instanceof Error ? e.message : String(e)}`;
-      }
-      (toggleBtn as HTMLButtonElement).disabled = false;
-    });
-
-    copyBtn.addEventListener('click', () => {
-      if (!currentOpenInvite) return;
-      navigator.clipboard.writeText(shareCode);
-      copyBtn.textContent = 'Copied!';
-      setTimeout(() => { copyBtn.textContent = 'Copy'; }, 2000);
-    });
-
-    // ── "Specific people" panel ───────────────────────────────────────
-    emailPanel.createEl('p', {
-      text: 'Add a collaborator by email. They must already have a FreeSync account. Only people you add can join.',
-      cls: 'freesync-share-desc',
-    });
-
-    const emailRow = emailPanel.createDiv({ cls: 'freesync-share-row' });
-    emailRow.style.marginTop = '10px';
-    const emailInput = emailRow.createEl('input', { cls: 'freesync-share-input', type: 'email' });
-    emailInput.placeholder = 'colleague@example.com';
-
-    const addBtn = emailRow.createEl('button', { text: 'Add member', cls: 'mod-cta freesync-share-btn' });
-    const statusEl = emailPanel.createEl('p', { cls: 'freesync-share-desc' });
-    statusEl.style.marginTop = '8px';
-
-    addBtn.addEventListener('click', async () => {
-      const email = emailInput.value.trim();
-      if (!email) return;
-      addBtn.textContent = 'Adding…';
-      (addBtn as HTMLButtonElement).disabled = true;
-      statusEl.textContent = '';
-      try {
-        const res = await requestUrl({
-          url: `${this.relayBase}/vaults/${this.vaultId}/invite`,
-          method: 'POST',
-          headers: { Authorization: `Bearer ${this.jwt}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email }),
-          throw: false,
-        });
-        if (res.status === 200) {
-          statusEl.textContent = res.json.signup_required
-            ? `✓ Invite sent to ${email}. They'll be automatically added to your vault once they sign up.`
-            : `✓ ${email} has been added to your vault.`;
-          emailInput.value = '';
-        } else {
-          statusEl.textContent = `Error: ${res.json?.error ?? 'Unknown error'}`;
-        }
-      } catch (e) {
-        statusEl.textContent = `Failed: ${e instanceof Error ? e.message : String(e)}`;
-      }
-      addBtn.textContent = 'Add member';
-      (addBtn as HTMLButtonElement).disabled = false;
-    });
-
-    activateTab('code');
+    contentEl.style.padding = '18px 22px 22px';
+    renderShareUI(contentEl, this.plugin);
   }
 
   onClose() { this.contentEl.empty(); }
@@ -796,20 +651,36 @@ class FreeSyncSettingTab extends PluginSettingTab {
       }
     }
 
-    // ── Invitations callout ──────────────────────────────────────────────
+    // ── Pending invitations (actionable) ─────────────────────────────────
     if (invitedVaults.length > 0) {
-      const callout = el.createDiv();
-      callout.style.cssText = 'padding:10px 12px;margin-bottom:20px;background:var(--background-modifier-hover);border-left:3px solid var(--interactive-accent);border-radius:4px;font-size:13px;';
-      callout.createEl('div', {
-        text: `You have ${invitedVaults.length} pending invitation${invitedVaults.length === 1 ? '' : 's'}: ${invitedVaults.map(v => v.name).join(', ')}.`,
-      });
-      const webApp = this.plugin.settings.webAppUrl.replace(/\/+$/, '');
-      const linkLine = callout.createEl('div');
-      linkLine.style.cssText = 'margin-top:4px;color:var(--text-muted);';
-      linkLine.createSpan({ text: 'Accept them in the ' });
-      const a = linkLine.createEl('a', { text: 'web dashboard', href: `${webApp}/dashboard` });
-      a.setAttr('target', '_blank');
-      linkLine.createSpan({ text: ', then reload this settings tab.' });
+      el.createEl('h3', { text: 'Invitations' });
+      const list = el.createDiv();
+      list.style.cssText = 'display:flex;flex-direction:column;gap:8px;margin-bottom:20px;';
+      for (const v of invitedVaults) {
+        const row = list.createDiv();
+        row.style.cssText = [
+          'display:flex', 'align-items:center', 'gap:10px',
+          'padding:12px 14px',
+          'background:var(--background-secondary)',
+          'border-left:3px solid var(--interactive-accent)',
+          'border-radius:6px',
+        ].join(';');
+
+        const info = row.createDiv();
+        info.style.cssText = 'flex:1;min-width:0;';
+        info.createEl('div', { text: v.name })
+          .style.cssText = 'font-weight:600;font-size:14px;';
+        info.createEl('div', { text: 'Someone shared this vault with you' })
+          .style.cssText = 'font-size:12px;color:var(--text-muted);margin-top:2px;';
+
+        const acceptBtn = row.createEl('button', { text: 'Accept', cls: 'mod-cta' });
+        acceptBtn.style.cssText = 'padding:6px 14px;';
+        const declineBtn = row.createEl('button', { text: 'Decline' });
+        declineBtn.style.cssText = 'padding:6px 12px;';
+
+        acceptBtn.addEventListener('click', () => void this.acceptInvitation(v.id, acceptBtn, declineBtn));
+        declineBtn.addEventListener('click', () => void this.declineInvitation(v.id, v.name, acceptBtn, declineBtn));
+      }
     }
 
     // ── Create new ────────────────────────────────────────────────────────
@@ -824,19 +695,53 @@ class FreeSyncSettingTab extends PluginSettingTab {
     nameInput.addEventListener('input', () => { newName = nameInput.value.trim(); });
     const createBtn = createRow.createEl('button', { text: 'Create', cls: 'mod-cta' });
     createBtn.addEventListener('click', () => void this.createVault(newName, createBtn));
+  }
 
-    // ── Join by code ──────────────────────────────────────────────────────
-    el.createEl('h3', { text: 'Join by invite code' });
-    let code = '';
-    const joinRow = el.createDiv();
-    joinRow.style.cssText = 'display:flex;gap:8px;margin-bottom:20px;';
-    const codeInput = joinRow.createEl('input');
-    codeInput.type = 'text';
-    codeInput.placeholder = 'vaultId/inviteCode';
-    codeInput.style.cssText = 'flex:1;padding:6px 10px;font-family:monospace;';
-    codeInput.addEventListener('input', () => { code = codeInput.value.trim(); });
-    const joinBtn = joinRow.createEl('button', { text: 'Join', cls: 'mod-cta' });
-    joinBtn.addEventListener('click', () => void this.joinVault(code, joinBtn));
+  private async acceptInvitation(vaultId: string, acceptBtn: HTMLButtonElement, declineBtn: HTMLButtonElement) {
+    acceptBtn.textContent = 'Accepting…';
+    acceptBtn.disabled = true;
+    declineBtn.disabled = true;
+    try {
+      const res = await requestUrl({
+        url: `${this.plugin.getRelayHttpBase()}/vaults/${vaultId}/accept`,
+        method: 'POST',
+        headers: { Authorization: `Bearer ${this.tempJwt}` },
+        throw: false,
+      });
+      if (res.status !== 200) {
+        new Notice(`Couldn't accept: ${res.json?.error ?? res.status}`);
+        acceptBtn.textContent = 'Accept'; acceptBtn.disabled = false; declineBtn.disabled = false;
+        return;
+      }
+      await this.pickExistingVault(vaultId);
+    } catch (e) {
+      new Notice(`Accept error: ${e instanceof Error ? e.message : String(e)}`);
+      acceptBtn.textContent = 'Accept'; acceptBtn.disabled = false; declineBtn.disabled = false;
+    }
+  }
+
+  private async declineInvitation(vaultId: string, vaultName: string, acceptBtn: HTMLButtonElement, declineBtn: HTMLButtonElement) {
+    if (!window.confirm(`Decline invitation to "${vaultName}"?`)) return;
+    declineBtn.textContent = 'Declining…';
+    declineBtn.disabled = true;
+    acceptBtn.disabled = true;
+    try {
+      const res = await requestUrl({
+        url: `${this.plugin.getRelayHttpBase()}/vaults/${vaultId}/decline`,
+        method: 'POST',
+        headers: { Authorization: `Bearer ${this.tempJwt}` },
+        throw: false,
+      });
+      if (res.status !== 200) {
+        new Notice(`Couldn't decline: ${res.json?.error ?? res.status}`);
+        declineBtn.textContent = 'Decline'; declineBtn.disabled = false; acceptBtn.disabled = false;
+        return;
+      }
+      this.display();  // re-render picker so the declined vault disappears
+    } catch (e) {
+      new Notice(`Decline error: ${e instanceof Error ? e.message : String(e)}`);
+      declineBtn.textContent = 'Decline'; declineBtn.disabled = false; acceptBtn.disabled = false;
+    }
   }
 
   private async pickExistingVault(vaultId: string) {
@@ -873,33 +778,6 @@ class FreeSyncSettingTab extends PluginSettingTab {
     }
   }
 
-  private async joinVault(code: string, btn: HTMLButtonElement) {
-    if (!code) { new Notice('Paste an invite code'); return; }
-    const slash = code.indexOf('/');
-    if (slash < 1) { new Notice('Invalid code — expected vaultId/inviteCode'); return; }
-    const vaultId = code.slice(0, slash);
-    const inviteCode = code.slice(slash + 1);
-    btn.textContent = 'Joining…';
-    btn.disabled = true;
-    try {
-      const res = await requestUrl({
-        url: `${this.plugin.getRelayHttpBase()}/vaults/${vaultId}/join`,
-        method: 'POST',
-        headers: { Authorization: `Bearer ${this.tempJwt}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ invite_code: inviteCode }),
-        throw: false,
-      });
-      if (res.status !== 200) {
-        new Notice(`Join failed: ${res.json?.error ?? res.status}`);
-        btn.textContent = 'Join'; btn.disabled = false;
-        return;
-      }
-      await this.pickExistingVault(vaultId);
-    } catch (e) {
-      new Notice(`Join error: ${e instanceof Error ? e.message : String(e)}`);
-      btn.textContent = 'Join'; btn.disabled = false;
-    }
-  }
 
   // ── State C: connected ──────────────────────────────────────────────────
   private renderConnected(el: HTMLElement) {
@@ -933,17 +811,10 @@ class FreeSyncSettingTab extends PluginSettingTab {
         this.display();
       }));
 
-    // Share section — reuse existing renderShareCode
-    el.createEl('h3', { text: 'Share vault', cls: 'freesync-settings-section' });
-    const shareArea = el.createDiv({ cls: 'freesync-share-area' });
-    if (this.plugin.currentJwt) {
-      this.renderShareCode(shareArea);
-    } else {
-      shareArea.createEl('p', {
-        text: 'Enable sync above to see your invite code.',
-        cls: 'freesync-share-desc',
-      });
-    }
+    // Share section — same Google-Docs-style UI as the ribbon share modal
+    const shareArea = el.createDiv();
+    shareArea.style.cssText = 'margin-top:18px;padding:16px 18px;background:var(--background-secondary);border-radius:8px;';
+    renderShareUI(shareArea, this.plugin);
   }
 
   private async fillVaultName(vaultLine: HTMLElement) {
@@ -1016,170 +887,5 @@ class FreeSyncSettingTab extends PluginSettingTab {
     });
   }
 
-  private async renderShareCode(container: HTMLElement) {
-    const loading = container.createEl('p', { text: 'Loading invite code…', cls: 'freesync-share-desc' });
-    try {
-      const res = await requestUrl({
-        url: `${this.plugin.getRelayHttpBase()}/vaults`,
-        headers: { Authorization: `Bearer ${this.plugin.currentJwt}` },
-        throw: false,
-      });
-      if (res.status !== 200) {
-        loading.textContent = `Error ${res.status}: ${res.json?.error ?? 'relay error'}`;
-        console.error('FreeSync share: GET /vaults failed', res.status, res.json);
-        return;
-      }
-      const vaults: Array<{ id: string; invite_code: string; name: string; open_invite: boolean }> = res.json;
-      const vault = vaults.find(v => v.id === this.plugin.settings.vaultId);
-      if (!vault) {
-        loading.textContent = `Vault not found in your account (ID: ${this.plugin.settings.vaultId.slice(0, 8)}…). Check Vault ID in settings.`;
-        console.error('FreeSync share: vault not in list', this.plugin.settings.vaultId, vaults.map(v => v.id));
-        return;
-      }
-      loading.remove();
-
-      const shareCode = `${vault.id}/${vault.invite_code}`;
-      const relayBase = this.plugin.getRelayHttpBase();
-      const vaultId = this.plugin.settings.vaultId;
-      const jwt = this.plugin.currentJwt!;
-
-      // ── Mode tabs ──────────────────────────────────────────────────
-      const modeRow = container.createDiv();
-      modeRow.style.cssText = 'display:flex;gap:8px;margin-bottom:12px;';
-
-      const makeTab = (label: string) => {
-        const btn = modeRow.createEl('button', { text: label });
-        btn.style.cssText = 'flex:1;padding:6px 10px;border-radius:6px;border:1px solid var(--background-modifier-border);cursor:pointer;font-size:12px;transition:all 0.12s;';
-        return btn;
-      };
-      const codeTab = makeTab('Anyone with the code');
-      const emailTab = makeTab('Specific people');
-      const codePanel = container.createDiv();
-      const emailPanel = container.createDiv();
-
-      const activateTab = (mode: 'code' | 'email') => {
-        const isCode = mode === 'code';
-        codePanel.style.display = isCode ? '' : 'none';
-        emailPanel.style.display = isCode ? 'none' : '';
-        codeTab.style.background = isCode ? 'var(--interactive-accent)' : '';
-        codeTab.style.color = isCode ? '#fff' : '';
-        codeTab.style.borderColor = isCode ? 'var(--interactive-accent)' : 'var(--background-modifier-border)';
-        emailTab.style.background = isCode ? '' : 'var(--interactive-accent)';
-        emailTab.style.color = isCode ? '' : '#fff';
-        emailTab.style.borderColor = isCode ? 'var(--background-modifier-border)' : 'var(--interactive-accent)';
-      };
-      codeTab.addEventListener('click', () => activateTab('code'));
-      emailTab.addEventListener('click', () => activateTab('email'));
-
-      // Code panel — with open_invite toggle
-      let currentOpenInvite = vault.open_invite ?? false;
-
-      const toggleRow = codePanel.createDiv();
-      toggleRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:8px;';
-      const toggleLabel = toggleRow.createEl('span');
-      toggleLabel.style.cssText = 'flex:1;font-size:12px;';
-      const toggleBtn = toggleRow.createEl('button');
-      toggleBtn.style.cssText = 'padding:3px 12px;border-radius:10px;font-size:11px;font-weight:600;cursor:pointer;border:none;transition:all 0.12s;';
-      const codeDesc = codePanel.createEl('p', { cls: 'freesync-share-desc' });
-      const codeRow = codePanel.createDiv({ cls: 'freesync-share-row' });
-      codeRow.style.marginTop = '6px';
-      const codeInput = codeRow.createEl('input', { cls: 'freesync-share-input' });
-      codeInput.value = shareCode;
-      codeInput.readOnly = true;
-      const copyBtn = codeRow.createEl('button', { text: 'Copy', cls: 'mod-cta freesync-share-btn' });
-      const toggleStatus = codePanel.createEl('p', { cls: 'freesync-share-desc' });
-      toggleStatus.style.marginTop = '4px';
-
-      const applyOpenInviteState = (enabled: boolean) => {
-        currentOpenInvite = enabled;
-        toggleLabel.textContent = enabled ? 'Anyone with the code can join' : 'Only invited people can join';
-        toggleBtn.textContent = enabled ? 'Enabled' : 'Enable code sharing';
-        toggleBtn.style.background = enabled ? 'var(--interactive-accent)' : 'var(--background-modifier-border)';
-        toggleBtn.style.color = enabled ? '#fff' : 'var(--text-muted)';
-        codeDesc.textContent = enabled
-          ? 'Anyone who pastes this code in FreeSync can join. Disable to prevent new code joins.'
-          : 'Code joining is off. Use "Specific people" to add collaborators directly.';
-        codeInput.style.opacity = enabled ? '1' : '0.4';
-        (copyBtn as HTMLButtonElement).disabled = !enabled;
-        copyBtn.style.opacity = enabled ? '1' : '0.4';
-      };
-      applyOpenInviteState(currentOpenInvite);
-
-      toggleBtn.addEventListener('click', async () => {
-        const next = !currentOpenInvite;
-        (toggleBtn as HTMLButtonElement).disabled = true;
-        toggleStatus.textContent = '';
-        try {
-          const r = await requestUrl({
-            url: `${relayBase}/vaults/${vaultId}/open-invite`,
-            method: 'PATCH',
-            headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ enabled: next }),
-            throw: false,
-          });
-          if (r.status === 200) applyOpenInviteState(next);
-          else toggleStatus.textContent = `Error: ${r.json?.error ?? 'Unknown error'}`;
-        } catch (e) {
-          toggleStatus.textContent = `Failed: ${e instanceof Error ? e.message : String(e)}`;
-        }
-        (toggleBtn as HTMLButtonElement).disabled = false;
-      });
-
-      codeInput.addEventListener('click', () => { if (currentOpenInvite) codeInput.select(); });
-      copyBtn.addEventListener('click', () => {
-        if (!currentOpenInvite) return;
-        navigator.clipboard.writeText(shareCode);
-        copyBtn.textContent = 'Copied!';
-        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 2000);
-      });
-
-      // Email panel
-      const emailRow = emailPanel.createDiv({ cls: 'freesync-share-row' });
-      const emailInput = emailRow.createEl('input', { cls: 'freesync-share-input', type: 'email' });
-      emailInput.placeholder = 'colleague@example.com';
-
-      const addBtn = emailRow.createEl('button', { text: 'Add', cls: 'mod-cta freesync-share-btn' });
-      const statusEl = emailPanel.createEl('p', { cls: 'freesync-share-desc' });
-      statusEl.style.marginTop = '6px';
-
-      addBtn.addEventListener('click', async () => {
-        const email = emailInput.value.trim();
-        if (!email) return;
-        addBtn.textContent = 'Adding…';
-        (addBtn as HTMLButtonElement).disabled = true;
-        statusEl.textContent = '';
-        try {
-          const r = await requestUrl({
-            url: `${relayBase}/vaults/${vaultId}/invite`,
-            method: 'POST',
-            headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email }),
-            throw: false,
-          });
-          if (r.status === 200) {
-            statusEl.textContent = r.json.signup_required
-              ? `✓ Invite sent to ${email}. They'll be automatically added to your vault once they sign up.`
-              : `✓ ${email} added to vault.`;
-            emailInput.value = '';
-          } else {
-            statusEl.textContent = `Error: ${r.json?.error ?? 'Unknown error'}`;
-          }
-        } catch (e) {
-          statusEl.textContent = `Failed: ${e instanceof Error ? e.message : String(e)}`;
-        }
-        addBtn.textContent = 'Add';
-        (addBtn as HTMLButtonElement).disabled = false;
-      });
-      emailPanel.createEl('p', {
-        text: 'Only people you add can join. They must already have a FreeSync account.',
-        cls: 'freesync-share-desc',
-      }).style.marginTop = '6px';
-
-      activateTab('code');
-    } catch (e) {
-      loading.textContent = `Failed to reach relay: ${e instanceof Error ? e.message : String(e)}`;
-      console.error('FreeSync share: fetch error', e);
-    }
-  }
 }
 

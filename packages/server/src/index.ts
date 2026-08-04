@@ -412,6 +412,383 @@ app.get('/vaults', async (req: Request, res: Response) => {
   res.json(enriched);
 });
 
+// ── GET /vaults/:vaultId/files ────────────────────────────────────────────────
+// List files in a vault's manifest. Used by the web browse page. Membership
+// must be 'active' (invited-only can't see contents).
+app.get('/vaults/:vaultId/files', async (req: Request, res: Response) => {
+  const auth = await authenticate(req.headers.authorization);
+  if (auth.error) { res.status(401).json({ error: auth.error }); return; }
+  const { userId } = auth;
+  const { vaultId } = req.params;
+
+  const { data: self } = await supabase
+    .from('vault_members')
+    .select('status')
+    .eq('vault_id', vaultId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (self?.status !== 'active') {
+    res.status(403).json({ error: 'Not an active member of this vault' });
+    return;
+  }
+
+  const manifestDoc = await loadManifest(vaultId);
+  if (!manifestDoc) { res.json([]); return; }
+
+  const files = manifestDoc.getMap<{
+    exists?: boolean;
+    binary?: boolean;
+    storageKey?: string;
+    lastEditedBy?: { userId: string; display_name: string; color: string };
+    lastEditedAt?: number;
+  }>('files');
+
+  const out: Array<{
+    path: string;
+    kind: 'markdown' | 'canvas' | 'binary' | 'text';
+    lastEditedBy: { userId: string; display_name: string; color: string } | null;
+    lastEditedAt: number | null;
+  }> = [];
+  for (const [path, entry] of files.entries()) {
+    if (!entry?.exists) continue;
+    out.push({
+      path,
+      kind: kindFor(path, entry.binary === true),
+      lastEditedBy: entry.lastEditedBy ?? null,
+      lastEditedAt: entry.lastEditedAt ?? null,
+    });
+  }
+  out.sort((a, b) => a.path.localeCompare(b.path));
+
+  // Only destroy if we allocated it — the shared docs map's copy must persist.
+  if (!(docs as Map<string, Y.Doc>).get(`${vaultId}/__manifest__`)) manifestDoc.destroy();
+  res.json(out);
+});
+
+// ── GET /vaults/:vaultId/files/*  ─────────────────────────────────────────────
+// Return the current content of a single file. Text/markdown/canvas are
+// stitched from the file's Y.Doc; binary files return a metadata pointer.
+app.get(/^\/vaults\/([^/]+)\/files\/(.+)$/, async (req: Request, res: Response) => {
+  const auth = await authenticate(req.headers.authorization);
+  if (auth.error) { res.status(401).json({ error: auth.error }); return; }
+  const { userId } = auth;
+  const vaultId = req.params[0];
+  const filePath = decodeURIComponent(req.params[1]);
+
+  const { data: self } = await supabase
+    .from('vault_members')
+    .select('status')
+    .eq('vault_id', vaultId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (self?.status !== 'active') {
+    res.status(403).json({ error: 'Not an active member of this vault' });
+    return;
+  }
+
+  const manifestDoc = await loadManifest(vaultId);
+  if (!manifestDoc) { res.status(404).json({ error: 'Vault has no manifest' }); return; }
+  const entry = manifestDoc.getMap<{
+    exists?: boolean;
+    binary?: boolean;
+    storageKey?: string;
+  }>('files').get(filePath);
+  // Note: manifestDoc is destroyed later (after rewriteEmbeds), not here — we
+  // still need the files map to resolve ![[image]] references.
+  if (!entry?.exists) {
+    if (!(docs as Map<string, Y.Doc>).get(`${vaultId}/__manifest__`)) manifestDoc.destroy();
+    res.status(404).json({ error: 'File not found' });
+    return;
+  }
+
+  const kind = kindFor(filePath, entry.binary === true);
+  if (kind === 'binary') {
+    // Signed URL to Supabase Storage — expires in 5 min. Lets the browser
+    // load an <img>/<embed> tag directly without proxying bytes through us.
+    let signed_url: string | null = null;
+    if (entry.storageKey) {
+      const { data } = await supabase.storage
+        .from(STORAGE_BUCKET)
+        .createSignedUrl(entry.storageKey, 300);
+      signed_url = data?.signedUrl ?? null;
+    }
+    if (!(docs as Map<string, Y.Doc>).get(`${vaultId}/__manifest__`)) manifestDoc.destroy();
+    res.json({
+      path: filePath,
+      kind,
+      storage_key: entry.storageKey ?? null,
+      signed_url,
+      image_kind: imageKindFor(filePath),
+    });
+    return;
+  }
+
+  // Load the file's Y.Doc (in-memory or from Postgres) and stringify.
+  //
+  // Historical wart: the plugin URL-encodes the file path when it connects
+  // to the WebSocket, so y-websocket keeps the encoded form as the docs-map
+  // key AND persists it that way in vault_docs.file_path. But the manifest
+  // stores the raw path. This endpoint has to encode when hitting the doc
+  // store even though the incoming request used the raw path.
+  const encodedPath = encodeURIComponent(filePath);
+  const docName = `${vaultId}/${encodedPath}`;
+  const liveDoc = (docs as Map<string, Y.Doc>).get(docName);
+  let fileDoc: Y.Doc | null = liveDoc ?? null;
+  if (!fileDoc) {
+    const { data } = await supabase
+      .from('vault_docs')
+      .select('yjs_state')
+      .eq('vault_id', vaultId)
+      .eq('file_path', encodedPath)
+      .maybeSingle();
+    if (data?.yjs_state) {
+      const bytes = decodeYjsState(data.yjs_state);
+      if (bytes) {
+        fileDoc = new Y.Doc();
+        Y.applyUpdate(fileDoc, bytes);
+      }
+    }
+  }
+  if (!fileDoc) {
+    // Diagnostic: list keys that share the vault prefix so we can spot
+    // subtle mismatches (encoding, casing, extra slashes).
+    const prefix = `${vaultId}/`;
+    const nearby = [...(docs as Map<string, Y.Doc>).keys()]
+      .filter((k) => k.startsWith(prefix))
+      .slice(0, 20);
+    console.log('[activity/preview] no doc for', JSON.stringify(docName),
+      'live keys in vault:', nearby.length ? nearby : '(none)');
+    res.json({ path: filePath, kind, content: '', not_yet_synced: true });
+    return;
+  }
+
+  let content = '';
+  if (kind === 'canvas') {
+    // Best-effort: read canvas-nodes / canvas-edges the plugin uses.
+    const nodes = fileDoc.getMap<Y.Map<unknown>>('canvas-nodes');
+    const edges = fileDoc.getMap<Y.Map<unknown>>('canvas-edges');
+    const asArray = (m: Y.Map<Y.Map<unknown>>) =>
+      [...m.entries()].map(([, e]) => (e as Y.Map<unknown>).toJSON())
+        .sort((a: { id?: string }, b: { id?: string }) => (a.id ?? '').localeCompare(b.id ?? ''));
+    content = JSON.stringify({ nodes: asArray(nodes), edges: asArray(edges) }, null, '\t') + '\n';
+  } else {
+    // Plugin stores text under the 'content' key; the default (empty) key
+    // would always return empty. See packages/plugin/src/sync.ts.
+    content = fileDoc.getText('content').toString();
+  }
+
+  if (!liveDoc) fileDoc.destroy();
+
+  // For markdown: rewrite Obsidian ![[image]] wikilink-embeds and standard
+  // ![alt](path) references to point at signed URLs of the referenced files.
+  // Without this, react-markdown either renders the wikilink as raw text or
+  // emits a broken <img> because the browser has no way to fetch the vault
+  // binary directly.
+  if (kind === 'markdown' && content) {
+    content = await rewriteEmbeds(content, vaultId, manifestDoc);
+  }
+
+  const manifestFromLive = (docs as Map<string, Y.Doc>).get(`${vaultId}/__manifest__`);
+  if (!manifestFromLive) manifestDoc.destroy();
+
+  res.json({ path: filePath, kind, content });
+});
+
+// Rewrite Obsidian-style image embeds in markdown to standard markdown image
+// syntax pointing at Supabase signed URLs. Two patterns:
+//   ![[filename.png]]           → wikilink embed (with optional |alt)
+//   ![alt](Attachments/foo.png) → standard markdown image
+// For each match, resolve to a vault file (exact path first, then basename
+// fallback because Obsidian wikilinks resolve by name, not path), fetch a
+// signed URL, and emit ![alt](signed_url). Non-image / unresolved links are
+// left untouched.
+async function rewriteEmbeds(text: string, vaultId: string, manifestDoc: Y.Doc): Promise<string> {
+  const files = manifestDoc.getMap<{ exists?: boolean; storageKey?: string }>('files');
+
+  // Build (basename → full path) index; only include existing binaries with
+  // an image kind so we don't accidentally rewrite non-images.
+  const byBasename = new Map<string, { path: string; storageKey: string }>();
+  const byPath = new Map<string, { storageKey: string }>();
+  for (const [path, entry] of files.entries()) {
+    if (!entry?.exists || !entry.storageKey) continue;
+    if (!imageKindFor(path)) continue;
+    const base = path.split('/').pop() ?? path;
+    byPath.set(path, { storageKey: entry.storageKey });
+    if (!byBasename.has(base)) byBasename.set(base, { path, storageKey: entry.storageKey });
+  }
+
+  if (byPath.size === 0) return text;
+
+  // Sign URLs on demand and cache within this request so we don't hit
+  // Supabase Storage multiple times for the same file.
+  const signedCache = new Map<string, string>();
+  const sign = async (storageKey: string): Promise<string | null> => {
+    if (signedCache.has(storageKey)) return signedCache.get(storageKey)!;
+    const { data } = await supabase.storage.from(STORAGE_BUCKET).createSignedUrl(storageKey, 300);
+    if (!data?.signedUrl) return null;
+    signedCache.set(storageKey, data.signedUrl);
+    return data.signedUrl;
+  };
+
+  // Collect all matches first, then replace with resolved URLs. Two passes
+  // because the replacement is async.
+  const wikilinkRe = /!\[\[([^\]|]+)(?:\|([^\]]*))?\]\]/g;
+  const mdImgRe = /!\[([^\]]*)\]\(([^)]+)\)/g;
+
+  interface Rewrite { match: string; replacement: string; index: number }
+  const rewrites: Rewrite[] = [];
+
+  for (const m of text.matchAll(wikilinkRe)) {
+    const target = m[1].trim();
+    const alt = (m[2] ?? '').trim();
+    const hit = byPath.get(target) ?? byBasename.get(target.split('/').pop() ?? target);
+    if (!hit) continue;
+    const url = await sign(hit.storageKey);
+    if (!url) continue;
+    rewrites.push({ match: m[0], replacement: `![${alt || target}](${url})`, index: m.index ?? 0 });
+  }
+  for (const m of text.matchAll(mdImgRe)) {
+    const alt = m[1];
+    const target = decodeURIComponent(m[2].trim());
+    // Skip external URLs — leave those alone
+    if (/^https?:\/\//i.test(target) || target.startsWith('data:')) continue;
+    const hit = byPath.get(target) ?? byBasename.get(target.split('/').pop() ?? target);
+    if (!hit) continue;
+    const url = await sign(hit.storageKey);
+    if (!url) continue;
+    rewrites.push({ match: m[0], replacement: `![${alt}](${url})`, index: m.index ?? 0 });
+  }
+
+  // Sort by index descending so slicing later matches don't shift earlier ones.
+  rewrites.sort((a, b) => b.index - a.index);
+  let out = text;
+  for (const r of rewrites) {
+    out = out.slice(0, r.index) + r.replacement + out.slice(r.index + r.match.length);
+  }
+  return out;
+}
+
+// Shared helper: load a vault's manifest Y.Doc, preferring in-memory over DB.
+async function loadManifest(vaultId: string): Promise<Y.Doc | null> {
+  const docName = `${vaultId}/__manifest__`;
+  const liveDoc = (docs as Map<string, Y.Doc>).get(docName);
+  if (liveDoc) return liveDoc;
+  const { data, error } = await supabase
+    .from('vault_docs')
+    .select('yjs_state')
+    .eq('vault_id', vaultId)
+    .eq('file_path', '__manifest__')
+    .maybeSingle();
+  if (error || !data?.yjs_state) return null;
+  const bytes = decodeYjsState(data.yjs_state);
+  if (!bytes) return null;
+  const doc = new Y.Doc();
+  Y.applyUpdate(doc, bytes);
+  return doc;
+}
+
+function kindFor(filePath: string, isBinary: boolean): 'markdown' | 'canvas' | 'binary' | 'text' {
+  if (isBinary) return 'binary';
+  const lower = filePath.toLowerCase();
+  if (lower.endsWith('.md')) return 'markdown';
+  if (lower.endsWith('.canvas')) return 'canvas';
+  return 'text';
+}
+
+// Sub-classify binary files so the client can pick <img> vs <embed> vs a
+// plain download link. Null for anything we can't render inline.
+function imageKindFor(filePath: string): 'image' | 'pdf' | 'audio' | 'video' | null {
+  const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico'].includes(ext)) return 'image';
+  if (ext === 'pdf') return 'pdf';
+  if (['mp3', 'wav', 'm4a', 'ogg'].includes(ext)) return 'audio';
+  if (['mp4', 'mov', 'webm'].includes(ext)) return 'video';
+  return null;
+}
+
+// ── GET /activity ─────────────────────────────────────────────────────────────
+// Recent edits across every vault the user is an active member of. Reads each
+// vault's manifest Y.Doc (in-memory if a client is connected, otherwise from
+// vault_docs) and extracts files with lastEditedBy/lastEditedAt metadata.
+app.get('/activity', async (req: Request, res: Response) => {
+  const auth = await authenticate(req.headers.authorization);
+  if (auth.error) { res.status(401).json({ error: auth.error }); return; }
+  const { userId } = auth;
+  const limit = Math.min(Number(req.query.limit ?? 20), 100);
+
+  // Vaults the user actively belongs to
+  const { data: memberRows, error: memberErr } = await supabase
+    .from('vault_members')
+    .select('vault_id, vaults!inner(id, name)')
+    .eq('user_id', userId)
+    .eq('status', 'active');
+  if (memberErr) { res.status(500).json({ error: memberErr.message }); return; }
+
+  type VaultRef = { id: string; name: string };
+  const vaults: VaultRef[] = (memberRows ?? []).flatMap((r: unknown) => {
+    const row = r as { vaults?: VaultRef | VaultRef[] };
+    if (!row.vaults) return [];
+    return Array.isArray(row.vaults) ? row.vaults : [row.vaults];
+  });
+  if (vaults.length === 0) { res.json([]); return; }
+
+  interface ActivityEntry {
+    vault_id: string;
+    vault_name: string;
+    file_path: string;
+    last_edited_by: { userId: string; display_name: string; color: string };
+    last_edited_at: number;
+  }
+
+  const activity: ActivityEntry[] = [];
+
+  // For each vault, get its manifest. Prefer the in-memory copy (up-to-date)
+  // and fall back to the persisted BYTEA. Skip vaults with neither.
+  for (const vault of vaults) {
+    const docName = `${vault.id}/__manifest__`;
+    let manifestDoc: Y.Doc | null = null;
+
+    const liveDoc = (docs as Map<string, Y.Doc>).get(docName);
+    if (liveDoc) {
+      manifestDoc = liveDoc;
+    } else {
+      const { data, error: docErr } = await supabase
+        .from('vault_docs')
+        .select('yjs_state')
+        .eq('vault_id', vault.id)
+        .eq('file_path', '__manifest__')
+        .maybeSingle();
+      if (docErr || !data?.yjs_state) continue;
+      const bytes = decodeYjsState(data.yjs_state);
+      if (!bytes) continue;
+      manifestDoc = new Y.Doc();
+      Y.applyUpdate(manifestDoc, bytes);
+    }
+
+    const files = manifestDoc.getMap<{
+      exists?: boolean;
+      lastEditedBy?: { userId: string; display_name: string; color: string };
+      lastEditedAt?: number;
+    }>('files');
+
+    for (const [filePath, entry] of files.entries()) {
+      if (!entry?.exists || !entry.lastEditedBy || !entry.lastEditedAt) continue;
+      activity.push({
+        vault_id: vault.id,
+        vault_name: vault.name,
+        file_path: filePath,
+        last_edited_by: entry.lastEditedBy,
+        last_edited_at: entry.lastEditedAt,
+      });
+    }
+
+    if (!liveDoc) manifestDoc.destroy();
+  }
+
+  activity.sort((a, b) => b.last_edited_at - a.last_edited_at);
+  res.json(activity.slice(0, limit));
+});
+
 // ── POST /vaults/:vaultId/join ────────────────────────────────────────────────
 app.post('/vaults/:vaultId/join', async (req: Request, res: Response) => {
   const auth = await authenticate(req.headers.authorization);
@@ -687,9 +1064,62 @@ app.get('/vaults/:vaultId/members', async (req: Request, res: Response) => {
     user_id: m.user_id,
     status: m.status,
     joined_at: m.joined_at,
+    email: null as string | null,
     profiles: profileMap.get(m.user_id) ?? null,
   }));
+
+  // Also include pending_invites — those are people invited by email who
+  // haven't signed up yet. They exist as far as vault access is concerned
+  // (an on_invite_confirmed trigger auto-adds them to vault_members when
+  // they sign up), so the owner should see them here to manage/cancel.
+  const { data: pendingRows } = await supabase
+    .from('pending_invites')
+    .select('email, created_at')
+    .eq('vault_id', vaultId);
+
+  for (const row of pendingRows ?? []) {
+    stitched.push({
+      user_id: null as unknown as string,     // no auth account yet
+      status: 'pending_signup',
+      joined_at: row.created_at,
+      email: row.email,
+      profiles: null,
+    });
+  }
+
   res.json(stitched);
+});
+
+// ── DELETE /vaults/:vaultId/pending-invites/:email ────────────────────────────
+// Cancel a pending_invites entry (person hasn't signed up yet). Separate from
+// the /members DELETE because pending_invites is keyed by email, not user_id.
+app.delete('/vaults/:vaultId/pending-invites/:email', async (req: Request, res: Response) => {
+  const auth = await authenticate(req.headers.authorization);
+  if (auth.error) { res.status(401).json({ error: auth.error }); return; }
+  const { userId } = auth;
+
+  const { vaultId, email } = req.params;
+  const decodedEmail = decodeURIComponent(email);
+
+  // Only the vault owner may cancel pending invites
+  const { data: vault } = await supabase
+    .from('vaults')
+    .select('owner_id')
+    .eq('id', vaultId)
+    .single();
+  if (!vault || vault.owner_id !== userId) {
+    res.status(403).json({ error: 'Only the vault owner can cancel pending invites' });
+    return;
+  }
+
+  const { error } = await supabase
+    .from('pending_invites')
+    .delete()
+    .eq('vault_id', vaultId)
+    .eq('email', decodedEmail);
+
+  if (error) { res.status(500).json({ error: error.message }); return; }
+  res.json({ cancelled: true });
 });
 
 // ── DELETE /vaults/:vaultId/members/:userId ───────────────────────────────────

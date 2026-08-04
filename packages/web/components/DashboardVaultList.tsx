@@ -14,15 +14,14 @@ import { relay, RelayError } from '@/lib/relay';
 import type { Vault, MembershipStatus } from '@/lib/types';
 import { THEME } from './theme';
 import { useSession } from '@/lib/session';
+import { ActivityFeed } from './ActivityFeed';
 
 export function DashboardVaultList() {
   const sessionState = useSession();
   const [vaults, setVaults] = useState<Vault[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
-  const [joining, setJoining] = useState(false);
   const [newName, setNewName] = useState('');
-  const [joinCode, setJoinCode] = useState('');
   const [busy, setBusy] = useState(false);
 
   const load = async () => {
@@ -51,47 +50,19 @@ export function DashboardVaultList() {
     } finally { setBusy(false); }
   };
 
-  const joinVault = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!joinCode.trim() || busy) return;
-    const trimmed = joinCode.trim();
-    const slash = trimmed.indexOf('/');
-    if (slash === -1) { setError('Invite code should look like "vaultId/inviteCode"'); return; }
-    const vaultId = trimmed.slice(0, slash);
-    const code = trimmed.slice(slash + 1);
-    setBusy(true);
-    try {
-      await relay(`/vaults/${vaultId}/join`, { method: 'POST', body: { invite_code: code } });
-      setJoinCode('');
-      setJoining(false);
-      await load();
-    } catch (e) {
-      setError(e instanceof RelayError ? e.message : String(e));
-    } finally { setBusy(false); }
-  };
-
   const myUserId = !sessionState.loading ? sessionState.session?.user.id : undefined;
 
   return (
     <div>
       <div style={styles.headerRow}>
         <h1 style={styles.pageTitle}>Your vaults</h1>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <button
-            type="button"
-            style={styles.secondaryBtn}
-            onClick={() => { setJoining((v) => !v); setCreating(false); }}
-          >
-            Join by code
-          </button>
-          <button
-            type="button"
-            style={styles.primaryBtn}
-            onClick={() => { setCreating((v) => !v); setJoining(false); }}
-          >
-            + New vault
-          </button>
-        </div>
+        <button
+          type="button"
+          style={styles.primaryBtn}
+          onClick={() => setCreating((v) => !v)}
+        >
+          + New vault
+        </button>
       </div>
 
       {creating && (
@@ -113,25 +84,6 @@ export function DashboardVaultList() {
         </form>
       )}
 
-      {joining && (
-        <form onSubmit={joinVault} style={styles.inlineForm}>
-          <input
-            autoFocus
-            type="text"
-            placeholder="vaultId/inviteCode"
-            value={joinCode}
-            onChange={(e) => setJoinCode(e.target.value)}
-            style={{ ...styles.input, fontFamily: '"Courier New", monospace' }}
-          />
-          <button type="submit" disabled={busy || !joinCode.trim()} style={styles.primaryBtn}>
-            {busy ? 'Joining…' : 'Join'}
-          </button>
-          <button type="button" onClick={() => { setJoining(false); setJoinCode(''); }} style={styles.linkBtn}>
-            Cancel
-          </button>
-        </form>
-      )}
-
       {error && <div style={styles.error}>{error}</div>}
 
       {vaults === null && !error && <div style={styles.muted}>Loading…</div>}
@@ -146,7 +98,7 @@ export function DashboardVaultList() {
           return (
             <div style={styles.empty}>
               <div style={{ fontSize: 15, color: THEME.textBright, marginBottom: 6 }}>No vaults yet</div>
-              <div style={styles.muted}>Create a new vault above, or join one with an invite code.</div>
+              <div style={styles.muted}>Create a new vault above, or ask a collaborator to invite you.</div>
             </div>
           );
         }
@@ -171,9 +123,11 @@ export function DashboardVaultList() {
               </section>
             )}
 
+            {active.length > 0 && <ActivityFeed />}
+
             {active.length > 0 && (
               <section>
-                {invited.length > 0 && <h2 style={styles.sectionHeading}>Your vaults</h2>}
+                <h2 style={styles.sectionHeading}>Your vaults</h2>
                 <ul style={styles.list}>
                   {active.map((v) => (
                     <li key={v.id}>

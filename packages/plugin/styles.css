@@ -556,3 +556,16 @@
 .freesync-share-area {
   padding-top: 4px;
 }
+
+/* ── Remote-edit pulse — briefly highlight text that arrived from peers ── */
+
+.freesync-remote-insert {
+  animation: freesync-remote-insert 600ms ease-out forwards;
+  border-radius: 2px;
+}
+
+@keyframes freesync-remote-insert {
+  0%   { background-color: rgba(124, 92, 252, 0.32); }
+  60%  { background-color: rgba(124, 92, 252, 0.20); }
+  100% { background-color: transparent; }
+}

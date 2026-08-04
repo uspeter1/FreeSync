@@ -49,7 +49,7 @@ export default function VaultDetail({ params }: Props) {
   if (!vault || !members) return <div style={{ color: THEME.textMuted, fontSize: 13 }}>Loading…</div>;
 
   const isOwner = vault.owner_id === myUserId;
-  const shareCode = `${vault.id}/${vault.invite_code}`;
+  const activeCount = members.filter((m) => m.status === 'active').length;
 
   const saveName = async () => {
     if (!nameDraft.trim() || busy) return;
@@ -58,27 +58,6 @@ export default function VaultDetail({ params }: Props) {
       const updated = await relay<Vault>(`/vaults/${vaultId}`, { method: 'PATCH', body: { name: nameDraft.trim() } });
       setVault({ ...vault, name: updated.name });
       setEditingName(false);
-    } catch (e) { setError(errMsg(e)); }
-    finally { setBusy(false); }
-  };
-
-  const toggleOpenInvite = async (enabled: boolean) => {
-    if (busy) return;
-    setBusy(true);
-    try {
-      await relay(`/vaults/${vaultId}/open-invite`, { method: 'PATCH', body: { enabled } });
-      setVault({ ...vault, open_invite: enabled });
-    } catch (e) { setError(errMsg(e)); }
-    finally { setBusy(false); }
-  };
-
-  const rotateCode = async () => {
-    if (busy) return;
-    if (!confirm('Rotate the invite code? Anyone using the old code will no longer be able to join.')) return;
-    setBusy(true);
-    try {
-      const { invite_code } = await relay<{ invite_code: string }>(`/vaults/${vaultId}/rotate-invite-code`, { method: 'POST' });
-      setVault({ ...vault, invite_code });
     } catch (e) { setError(errMsg(e)); }
     finally { setBusy(false); }
   };
@@ -94,9 +73,9 @@ export default function VaultDetail({ params }: Props) {
         method: 'POST', body: { email: target },
       });
       let msg: string;
-      if (r.invited && r.signup_required) msg = `Invite sent to ${target}. They'll see it in their dashboard after signing up.`;
+      if (r.invited && r.signup_required) msg = `Invite sent to ${target}. They'll see it after signing up.`;
       else if (r.invited && r.already === 'invited') msg = `${target} was already invited — no new notification sent.`;
-      else if (r.invited) msg = `Invited ${target}. They'll see the invitation in their dashboard.`;
+      else if (r.invited) msg = `Invited ${target}.`;
       else msg = `${target} is already a member of this vault.`;
       setInviteFlash(msg);
       setInviteEmail('');
@@ -105,14 +84,24 @@ export default function VaultDetail({ params }: Props) {
     finally { setBusy(false); }
   };
 
-  const removeMember = async (memberId: string, displayName: string) => {
-    if (!confirm(`Remove ${displayName} from this vault?`)) return;
+  const removeMember = async (member: VaultMember, displayName: string) => {
+    const isPendingSignup = member.status === 'pending_signup';
+    const label = isPendingSignup ? 'Cancel invitation' : (member.status === 'invited' ? 'Cancel invitation' : 'Remove');
+    if (!confirm(
+      isPendingSignup || member.status === 'invited'
+        ? `Cancel invitation for ${displayName}?`
+        : `Remove ${displayName} from this vault? They will lose access immediately.`
+    )) return;
     setBusy(true);
     try {
-      await relay(`/vaults/${vaultId}/members/${memberId}`, { method: 'DELETE' });
-      setMembers(members.filter((m) => m.user_id !== memberId));
+      const url = isPendingSignup
+        ? `/vaults/${vaultId}/pending-invites/${encodeURIComponent(member.email ?? '')}`
+        : `/vaults/${vaultId}/members/${member.user_id}`;
+      await relay(url, { method: 'DELETE' });
+      await load();
     } catch (e) { setError(errMsg(e)); }
     finally { setBusy(false); }
+    void label; // silence
   };
 
   const doLeave = async () => {
@@ -132,10 +121,23 @@ export default function VaultDetail({ params }: Props) {
     } catch (e) { setError(errMsg(e)); setBusy(false); }
   };
 
+  const sortedMembers = [...members].sort((a, b) => {
+    const rank = (m: VaultMember) => {
+      if (m.user_id === vault.owner_id) return 0;
+      if (m.status === 'active') return 1;
+      if (m.status === 'invited') return 2;
+      return 3; // pending_signup
+    };
+    const ra = rank(a), rb = rank(b);
+    if (ra !== rb) return ra - rb;
+    return displayName(a).localeCompare(displayName(b));
+  });
+
   return (
     <div>
       <a href="/dashboard" style={styles.back}>← All vaults</a>
 
+      {/* Title + inline rename */}
       <div style={styles.titleRow}>
         {!editingName ? (
           <>
@@ -165,14 +167,42 @@ export default function VaultDetail({ params }: Props) {
           </>
         )}
       </div>
+      <div style={styles.subtle}>
+        {activeCount} {activeCount === 1 ? 'person has' : 'people have'} access
+      </div>
+
+      <a href={`/dashboard/vaults/${vault.id}/browse`} style={styles.browseLink}>
+        Browse files →
+      </a>
 
       {error && <div style={styles.error}>{error}</div>}
 
-      <Section title="Members">
+      {/* People with access — email invite on top, then combined list */}
+      <Section title="People with access">
+        {isOwner ? (
+          <form onSubmit={invite} style={styles.inviteRow}>
+            <input
+              type="email"
+              placeholder="Add people by email"
+              value={inviteEmail}
+              onChange={(e) => setInviteEmail(e.target.value)}
+              style={styles.pillInput}
+            />
+            <button type="submit" disabled={busy || !inviteEmail.trim()} style={styles.pillBtn}>
+              {busy ? 'Sending…' : 'Send'}
+            </button>
+          </form>
+        ) : (
+          <div style={{ ...styles.subtle, marginBottom: 20 }}>
+            Only the vault owner can invite people.
+          </div>
+        )}
+        {inviteFlash && <div style={styles.success}>{inviteFlash}</div>}
+
         <ul style={styles.memberList}>
-          {members.filter((m) => m.status === 'active').map((m) => (
+          {sortedMembers.map((m) => (
             <MemberRow
-              key={m.user_id}
+              key={memberKey(m)}
               m={m}
               vault={vault}
               myUserId={myUserId}
@@ -183,71 +213,10 @@ export default function VaultDetail({ params }: Props) {
         </ul>
       </Section>
 
-      {members.some((m) => m.status === 'invited') && (
-        <Section title="Invitations">
-          <ul style={styles.memberList}>
-            {members.filter((m) => m.status === 'invited').map((m) => (
-              <MemberRow
-                key={m.user_id}
-                m={m}
-                vault={vault}
-                myUserId={myUserId}
-                isOwner={isOwner}
-                onRemove={removeMember}
-                invited
-              />
-            ))}
-          </ul>
-        </Section>
-      )}
-
-      <Section title="Invite people">
-        {isOwner && (
-          <form onSubmit={invite} style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
-            <input
-              type="email"
-              placeholder="email@example.com"
-              value={inviteEmail}
-              onChange={(e) => setInviteEmail(e.target.value)}
-              style={{ ...styles.input, flex: 1 }}
-            />
-            <button type="submit" disabled={busy || !inviteEmail.trim()} style={styles.primaryBtn}>Invite</button>
-          </form>
-        )}
-        {!isOwner && <div style={{ ...styles.subtle, marginBottom: 20 }}>Only the vault owner can invite people by email.</div>}
-        {inviteFlash && <div style={styles.success}>{inviteFlash}</div>}
-
-        <div style={styles.subSection}>
-          <div style={styles.subTitle}>Invite by code</div>
-          <div style={styles.subtle}>
-            {vault.open_invite
-              ? 'Anyone with this code can join. Rotate the code if it leaks.'
-              : 'Code sharing is off. Turn it on to let people join with just the code.'}
-          </div>
-          <div style={{ ...styles.codeBox, opacity: vault.open_invite ? 1 : 0.4 }}>
-            {shareCode}
-            <button type="button" onClick={() => navigator.clipboard.writeText(shareCode)} style={styles.copyBtn} disabled={!vault.open_invite}>Copy</button>
-          </div>
-          {isOwner && (
-            <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-              <button
-                type="button"
-                onClick={() => toggleOpenInvite(!vault.open_invite)}
-                disabled={busy}
-                style={vault.open_invite ? styles.secondaryBtn : styles.primaryBtn}
-              >
-                {vault.open_invite ? 'Disable code sharing' : 'Enable code sharing'}
-              </button>
-              <button type="button" onClick={rotateCode} disabled={busy} style={styles.secondaryBtn}>Rotate code</button>
-            </div>
-          )}
-        </div>
-      </Section>
-
       <Section title="Danger zone" tone="danger">
         {!isOwner && (
           <div>
-            <div style={styles.subtle}>Leaving removes your access. The vault stays for other members. You can rejoin if the owner shares an invite.</div>
+            <div style={styles.subtle}>Leaving removes your access. The vault stays for other members. You can rejoin if the owner invites you again.</div>
             <button type="button" onClick={() => setShowLeave(true)} style={{ ...styles.dangerBtn, marginTop: 12 }}>Leave vault</button>
           </div>
         )}
@@ -260,25 +229,21 @@ export default function VaultDetail({ params }: Props) {
       </Section>
 
       {showLeave && (
-        <ConfirmModal
-          title="Leave vault?"
-          onCancel={() => setShowLeave(false)}
-        >
+        <ConfirmModal title="Leave vault?" onCancel={() => setShowLeave(false)}>
           <p style={{ marginBottom: 16 }}>
             You&apos;ll lose access to <strong>{vault.name}</strong>. Other members keep working normally.
           </p>
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
             <button type="button" onClick={() => setShowLeave(false)} style={styles.secondaryBtn}>Cancel</button>
-            <button type="button" onClick={doLeave} disabled={busy} style={styles.dangerBtn}>{busy ? 'Leaving…' : 'Leave vault'}</button>
+            <button type="button" onClick={doLeave} disabled={busy} style={styles.dangerBtn}>
+              {busy ? 'Leaving…' : 'Leave vault'}
+            </button>
           </div>
         </ConfirmModal>
       )}
 
       {showDelete && (
-        <ConfirmModal
-          title="Delete vault?"
-          onCancel={() => { setShowDelete(false); setDeleteConfirm(''); }}
-        >
+        <ConfirmModal title="Delete vault?" onCancel={() => { setShowDelete(false); setDeleteConfirm(''); }}>
           <p style={{ marginBottom: 12 }}>
             This permanently deletes <strong>{vault.name}</strong> and all its content for every member. It cannot be undone.
           </p>
@@ -309,37 +274,57 @@ export default function VaultDetail({ params }: Props) {
 }
 
 function MemberRow({
-  m, vault, myUserId, isOwner, onRemove, invited,
+  m, vault, myUserId, isOwner, onRemove,
 }: {
   m: VaultMember;
   vault: Vault;
   myUserId: string | undefined;
   isOwner: boolean;
-  onRemove: (userId: string, displayName: string) => void;
-  invited?: boolean;
+  onRemove: (m: VaultMember, displayName: string) => void;
 }) {
-  const name = m.profiles?.display_name ?? m.user_id.slice(0, 8);
+  const name = displayName(m);
   const color = m.profiles?.color ?? THEME.accent;
-  const initials = (name[0] ?? '?').toUpperCase();
-  const isSelf = m.user_id === myUserId;
+  const initial = avatarInitial(m);
+  const isSelf = m.user_id != null && m.user_id === myUserId;
   const isOwnerRow = m.user_id === vault.owner_id;
+  const isPending = m.status === 'invited' || m.status === 'pending_signup';
+  const canRemove = isOwner && !isOwnerRow;
+
+  const roleLabel =
+    isOwnerRow ? 'Owner' :
+    m.status === 'active' ? 'Editor' :
+    'Invited';
+
+  const subtitle =
+    m.status === 'pending_signup' ? "Invited — hasn't signed up yet" :
+    m.status === 'invited' ? 'Invitation pending' :
+    (isOwnerRow ? 'Owner' : 'Editor');
+
   return (
     <li style={styles.memberRow}>
-      <div style={{ ...styles.memberAvatar, background: color, opacity: invited ? 0.5 : 1 }}>{initials}</div>
-      <div style={{ flex: 1 }}>
-        <div style={{ color: THEME.textBright, fontSize: 13 }}>
-          {name}
-          {isSelf && <span style={styles.subtle}> (you)</span>}
-          {isOwnerRow && <span style={styles.badge}>Owner</span>}
-          {invited && <span style={styles.invitedBadge}>Invited</span>}
-        </div>
-        <div style={styles.subtle}>
-          {invited ? 'Waiting to accept' : `Joined ${new Date(m.joined_at).toLocaleDateString()}`}
-        </div>
+      <div style={{
+        ...styles.memberAvatar,
+        background: color,
+        opacity: isPending ? 0.55 : 1,
+      }}>
+        {initial}
       </div>
-      {isOwner && !isOwnerRow && (
-        <button type="button" onClick={() => onRemove(m.user_id, name)} style={styles.dangerLinkBtn}>
-          {invited ? 'Revoke' : 'Remove'}
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={styles.memberName}>
+          {name}{isSelf && <span style={{ color: THEME.textMuted }}> (you)</span>}
+        </div>
+        <div style={styles.subtle}>{subtitle}</div>
+      </div>
+      <div style={styles.roleLabel}>{roleLabel}</div>
+      {canRemove && (
+        <button
+          type="button"
+          onClick={() => onRemove(m, name)}
+          style={styles.removeBtn}
+          title={isPending ? 'Cancel invitation' : 'Remove member'}
+          aria-label={isPending ? 'Cancel invitation' : 'Remove member'}
+        >
+          ×
         </button>
       )}
     </li>
@@ -386,6 +371,25 @@ function ErrorPanel({ error }: { error: string }) {
   );
 }
 
+function displayName(m: VaultMember): string {
+  const n = m.profiles?.display_name?.trim();
+  if (n) return n;
+  if (m.email) return m.email;
+  if (m.status === 'invited') return '(pending)';
+  return (m.user_id ?? '').slice(0, 8) + '…';
+}
+
+function avatarInitial(m: VaultMember): string {
+  const n = m.profiles?.display_name?.trim();
+  if (n) return n[0].toUpperCase();
+  if (m.email) return m.email[0].toUpperCase();
+  return '⧗';
+}
+
+function memberKey(m: VaultMember): string {
+  return m.user_id ?? `pending:${m.email ?? Math.random()}`;
+}
+
 function errMsg(e: unknown): string {
   return e instanceof RelayError ? e.message : String(e);
 }
@@ -402,7 +406,7 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'flex',
     alignItems: 'center',
     gap: 12,
-    marginBottom: 24,
+    marginBottom: 4,
   },
   pageTitle: {
     fontSize: 24,
@@ -412,6 +416,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   section: {
     padding: 24,
+    marginTop: 20,
     marginBottom: 20,
     background: THEME.surface,
     border: `1px solid ${THEME.border}`,
@@ -424,10 +429,45 @@ const styles: Record<string, React.CSSProperties> = {
     letterSpacing: 0.5,
     marginBottom: 16,
   },
-  subSection: { paddingTop: 8 },
-  subTitle: { fontSize: 13, fontWeight: 500, color: THEME.textBright, marginBottom: 6 },
-  subtle: { fontSize: 12, color: THEME.textMuted, marginTop: 6 },
-  memberList: { listStyle: 'none' },
+  subtle: { fontSize: 12, color: THEME.textMuted, marginTop: 2 },
+  browseLink: {
+    display: 'inline-block',
+    marginTop: 10,
+    fontSize: 13,
+    color: THEME.link,
+    textDecoration: 'none',
+    fontWeight: 500,
+  },
+  inviteRow: {
+    display: 'flex',
+    gap: 8,
+    marginBottom: 20,
+  },
+  pillInput: {
+    flex: 1,
+    padding: '10px 16px',
+    background: THEME.bg,
+    color: THEME.textBright,
+    border: `1px solid ${THEME.border}`,
+    borderRadius: 999,
+    fontSize: 14,
+    outline: 'none',
+  },
+  pillBtn: {
+    padding: '10px 24px',
+    background: THEME.accent,
+    color: '#fff',
+    border: 'none',
+    borderRadius: 999,
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  memberList: {
+    listStyle: 'none',
+    padding: 0,
+    margin: 0,
+  },
   memberRow: {
     display: 'flex',
     alignItems: 'center',
@@ -436,59 +476,44 @@ const styles: Record<string, React.CSSProperties> = {
     borderBottom: `1px solid ${THEME.border}`,
   },
   memberAvatar: {
-    width: 32,
-    height: 32,
+    flexShrink: 0,
+    width: 34,
+    height: 34,
     borderRadius: '50%',
     color: '#fff',
-    fontSize: 12,
+    fontSize: 13,
     fontWeight: 600,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
   },
-  badge: {
-    marginLeft: 8,
-    padding: '2px 8px',
-    background: THEME.accentSoft,
-    color: THEME.link,
-    borderRadius: 10,
-    fontSize: 10,
-    fontWeight: 500,
-    verticalAlign: 'middle',
+  memberName: {
+    fontSize: 13,
+    color: THEME.textBright,
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
   },
-  invitedBadge: {
-    marginLeft: 8,
-    padding: '2px 8px',
-    background: 'rgba(167,139,250,0.14)',
-    color: THEME.link,
-    borderRadius: 10,
-    fontSize: 10,
-    fontWeight: 500,
-    verticalAlign: 'middle',
+  roleLabel: {
+    fontSize: 12,
+    color: THEME.textMuted,
+    padding: '0 12px 0 8px',
+    flexShrink: 0,
   },
-  codeBox: {
+  removeBtn: {
+    width: 26,
+    height: 26,
+    padding: 0,
+    background: 'transparent',
+    color: THEME.textMuted,
+    border: 'none',
+    borderRadius: '50%',
+    fontSize: 20,
+    lineHeight: 1,
+    cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 8,
-    padding: '10px 14px',
-    marginTop: 10,
-    background: THEME.bg,
-    border: `1px solid ${THEME.border}`,
-    borderRadius: 6,
-    fontFamily: '"Courier New", monospace',
-    fontSize: 12,
-    color: THEME.textBright,
-    wordBreak: 'break-all',
-  },
-  copyBtn: {
-    padding: '4px 10px',
-    background: THEME.surface,
-    color: THEME.text,
-    border: `1px solid ${THEME.border}`,
-    borderRadius: 4,
-    fontSize: 11,
-    cursor: 'pointer',
+    justifyContent: 'center',
     flexShrink: 0,
   },
   input: {
@@ -538,14 +563,6 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 500,
     cursor: 'pointer',
   },
-  dangerLinkBtn: {
-    padding: '6px 10px',
-    background: 'transparent',
-    color: THEME.pink,
-    border: 'none',
-    fontSize: 12,
-    cursor: 'pointer',
-  },
   error: {
     padding: '10px 14px',
     background: 'rgba(244,114,182,0.08)',
@@ -553,7 +570,7 @@ const styles: Record<string, React.CSSProperties> = {
     color: THEME.pink,
     borderRadius: 6,
     fontSize: 13,
-    marginBottom: 16,
+    marginTop: 16,
   },
   success: {
     padding: '10px 14px',
@@ -562,7 +579,7 @@ const styles: Record<string, React.CSSProperties> = {
     color: THEME.green,
     borderRadius: 6,
     fontSize: 13,
-    marginBottom: 12,
+    marginBottom: 16,
   },
   modalScrim: {
     position: 'fixed',

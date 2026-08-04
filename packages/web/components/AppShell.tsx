@@ -76,6 +76,7 @@ function Header({ session }: { session: Session }) {
         {menuOpen && (
           <div style={styles.menu} onClick={(e) => e.stopPropagation()}>
             <div style={styles.menuEmail} title={email}>{email}</div>
+            <a href="/dashboard/profile" style={{ ...styles.menuItem, textDecoration: 'none' }}>Profile settings</a>
             <button type="button" onClick={signOut} style={styles.menuItem}>Sign out</button>
           </div>
         )}

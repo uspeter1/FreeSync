@@ -124,14 +124,20 @@ export function remoteCursorsExtension(ref: AwarenessRef): Extension {
       let interval: ReturnType<typeof setInterval> | null = null;
       let awarenessCleaner: (() => void) | null = null;
 
+      // Awareness 'change' can fire mid-update (Yjs message → awareness state
+      // change happens inside a CM6 view update on the same tick). CM6 throws
+      // "Calls to EditorView.update are not allowed while an update is in
+      // progress" if we dispatch synchronously from that handler — Obsidian
+      // tightened this recently. Defer with rAF so the dispatch runs after
+      // the current update settles.
+      const safeRefresh = () => requestAnimationFrame(() => view.dispatch({ effects: cursorRefresh.of() }));
+
       const tryConnect = () => {
         if (awarenessCleaner || !ref.awareness) return;
-        const handler = () => view.dispatch({ effects: cursorRefresh.of() });
-        ref.awareness.on('change', handler);
-        awarenessCleaner = () => ref.awareness?.off('change', handler);
+        ref.awareness.on('change', safeRefresh);
+        awarenessCleaner = () => ref.awareness?.off('change', safeRefresh);
         if (interval !== null) { clearInterval(interval); interval = null; }
-        // Trigger an immediate rebuild now that awareness is available
-        view.dispatch({ effects: cursorRefresh.of() });
+        safeRefresh();
       };
 
       tryConnect();
