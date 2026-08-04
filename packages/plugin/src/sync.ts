@@ -1,10 +1,53 @@
-import { App, TFile, TAbstractFile, Notice } from 'obsidian';
+import { App, TFile, TAbstractFile } from 'obsidian';
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
+import { SupabaseClient } from '@supabase/supabase-js';
 import { PresenceManager } from './presence';
 import { minimalDiff } from './diff';
+import { DeleteDebouncer } from './delete-debounce';
+import {
+  isCanvasFile, applyCanvasFromDisk, serializeCanvasToDisk,
+  getCanvasNodes, getCanvasEdges,
+} from './canvas-sync';
 
 const LOCAL_ORIGIN = 'local';
+const STORAGE_BUCKET = 'vault-assets';
+
+// Cloud-sync engines (OneDrive, Dropbox, iCloud) routinely remove a file from
+// disk for a fraction of a second mid-sync. Obsidian's file watcher reports
+// that as a `delete`, and if we propagate it immediately every peer
+// permanently loses the file. We hold deletes for this window and cancel
+// them if a `create` for the same path arrives.
+const DELETE_DEBOUNCE_MS = 3000;
+
+// Interval for the periodic reconciliation sweep — catches files that ended
+// up on disk without firing Obsidian's Vault events (community plugins that
+// write via app.vault.adapter.write() bypass Vault.on('create'/'modify'),
+// which is what watchVault listens for). The sweep is cheap (getFiles() is
+// in-memory) so a short interval is fine.
+const RECONCILE_INTERVAL_MS = 30_000;
+
+const BINARY_EXTENSIONS = new Set([
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico',
+  'pdf', 'mp3', 'mp4', 'mov', 'avi', 'wav',
+  'zip', 'tar', 'gz', 'xlsx', 'docx', 'pptx',
+]);
+
+function isBinaryFile(filePath: string): boolean {
+  const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
+  return BINARY_EXTENSIONS.has(ext);
+}
+
+function contentType(filePath: string): string {
+  const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
+  const map: Record<string, string> = {
+    png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+    gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
+    ico: 'image/x-icon', pdf: 'application/pdf',
+    mp3: 'audio/mpeg', mp4: 'video/mp4', mov: 'video/quicktime', wav: 'audio/wav',
+  };
+  return map[ext] ?? 'application/octet-stream';
+}
 
 export interface SyncSettings {
   relayUrl: string;
@@ -13,32 +56,128 @@ export interface SyncSettings {
   userId: string;
   displayName: string;
   color: string;
+  supabase: SupabaseClient;
+  // Explicit URL + anon key for direct fetch calls to Supabase Storage —
+  // reading them off the SupabaseClient via as-any casts is unreliable
+  // (private props, minified in prod builds).
+  supabaseUrl: string;
+  supabaseAnonKey: string;
 }
 
+// Shape stored per file in the manifest Y.Map
+type FileEntry = {
+  exists: boolean;
+  renamedFrom?: string;
+  lastEditedBy?: { userId: string; display_name: string; color: string };
+  lastEditedAt?: number;
+  binary?: boolean;
+  storageKey?: string;
+  binaryVersion?: number;
+};
+
 export class SyncManager {
-  private providers = new Map<string, WebsocketProvider>();
+  providers = new Map<string, WebsocketProvider>();
   private docs = new Map<string, Y.Doc>();
-  private manifestDoc: Y.Doc | null = null;
-  private manifestProvider: WebsocketProvider | null = null;
+  private commentsMaps = new Map<string, Y.Map<Y.Map<any>>>();
+  manifestDoc: Y.Doc | null = null;
+  manifestProvider: WebsocketProvider | null = null;
   private unsubscribers: (() => void)[] = [];
   private settings: SyncSettings | null = null;
-  // Paths currently being created/deleted by incoming remote ops — skip re-broadcasting
   private remoteFileOps = new Set<string>();
+  // storageKeys we just uploaded — prevents re-download loop
+  private recentlyUploaded = new Set<string>();
+  // Per-path debounce coordinator for local deletions (see DELETE_DEBOUNCE_MS)
+  private deleteDebouncer: DeleteDebouncer;
+  // Handle for the periodic reconciliation sweep — see reconcileLocalFiles.
+  private reconcileTimer: ReturnType<typeof setInterval> | null = null;
+  onFileConnected: ((filePath: string, yComments: Y.Map<Y.Map<any>>) => void) | null = null;
 
-  constructor(private app: App, private presence: PresenceManager) {}
+  constructor(private app: App, private presence: PresenceManager) {
+    this.deleteDebouncer = new DeleteDebouncer({
+      delayMs: DELETE_DEBOUNCE_MS,
+      fileExists: (path) => this.app.vault.getAbstractFileByPath(path) instanceof TFile,
+      propagate: (path) => this.propagateDelete(path),
+    });
+  }
+
+  private propagateDelete(path: string): void {
+    if (isBinaryFile(path) && this.settings) {
+      const storageKey = `${this.settings.vaultId}/${path}`;
+      this.settings.supabase.storage.from(STORAGE_BUCKET).remove([storageKey])
+        .catch(err => console.error('[FreeSync] Storage delete failed:', err));
+    }
+    const fileMap = this.manifestDoc?.getMap<FileEntry>('files');
+    this.manifestDoc?.transact(() => {
+      fileMap?.delete(path);
+    }, LOCAL_ORIGIN);
+    this.disconnectFile(path);
+  }
+
+  // Periodic backstop for files that appeared on disk without firing
+  // Vault.on('create'). Common cause: community plugins that write via
+  // app.vault.adapter.write*() (bypasses Vault events entirely). This walks
+  // the current vault, diffs against the manifest, and adds any local-only
+  // file — same code path as onCreate.
+  //
+  // Only ADDS. Removals stay with the delete-debouncer / onDelete flow so
+  // we don't race against pending debounces or accidentally propagate a
+  // filesystem hiccup as a deletion.
+  private async reconcileLocalFiles(): Promise<void> {
+    if (!this.settings || !this.manifestDoc) return;
+    const fileMap = this.manifestDoc.getMap<FileEntry>('files');
+    const localFiles = this.app.vault.getFiles();
+    for (const file of localFiles) {
+      if (this.remoteFileOps.has(file.path)) continue;
+      const entry = fileMap.get(file.path);
+      if (entry?.exists) continue; // already in manifest → nothing to do
+
+      // Binary vs text branch mirrors onCreate.
+      if (isBinaryFile(file.path)) {
+        try { await this.uploadBinaryFile(file); }
+        catch (err) { console.error('[FreeSync] reconcile: binary upload failed', file.path, err); }
+      } else {
+        this.manifestDoc.transact(() => {
+          fileMap.set(file.path, { exists: true });
+        }, LOCAL_ORIGIN);
+        try { await this.connectFile(file.path); }
+        catch (err) { console.error('[FreeSync] reconcile: connectFile failed', file.path, err); }
+      }
+    }
+  }
+
+  getComments(filePath: string): Y.Map<Y.Map<any>> | null {
+    return this.commentsMaps.get(filePath) ?? null;
+  }
+
+  getHistorySnapshot(filePath: string): Array<{ userId: string; display_name: string; color: string; timestamp: number; content: string }> {
+    const doc = this.docs.get(filePath);
+    if (!doc) return [];
+    const yHistory = doc.getArray<any>('history');
+    const entries = [];
+    for (let i = 0; i < yHistory.length; i++) entries.push(yHistory.get(i));
+    return entries;
+  }
 
   async start(settings: SyncSettings) {
     this.settings = settings;
     await this.connectManifest();
     this.watchVault();
     const activeFile = this.app.workspace.getActiveFile();
-    if (activeFile) await this.connectFile(activeFile.path);
+    this.presence.setActiveFile(activeFile?.path ?? null);
+    if (activeFile && !isBinaryFile(activeFile.path)) await this.connectFile(activeFile.path);
+
+    // Reconciliation: waits for the manifest to sync before it can safely diff
+    // (otherwise it would think the manifest is empty and add every local
+    // file, creating spurious "add" events for the peer). Starts one sweep
+    // immediately after sync and then every RECONCILE_INTERVAL_MS.
+    this.manifestProvider?.on('sync', (isSynced: boolean) => {
+      if (!isSynced || this.reconcileTimer) return;
+      void this.reconcileLocalFiles();
+      this.reconcileTimer = setInterval(() => { void this.reconcileLocalFiles(); }, RECONCILE_INTERVAL_MS);
+    });
   }
 
   // ── Manifest room ──────────────────────────────────────────────────────────
-  // Always connected. Carries:
-  //   • Yjs Awareness → global presence (all vault members visible)
-  //   • Y.Map 'files' → file tree (create/delete propagation)
 
   private connectManifest() {
     if (!this.settings) return;
@@ -61,33 +200,106 @@ export class SyncManager {
       activeFile: null,
     });
 
-    // Watch the file-tree map for remote create/delete events
-    const fileMap = this.manifestDoc.getMap<{ exists: boolean }>('files');
-    const onFileMapChange = (event: Y.YMapEvent<{ exists: boolean }>) => {
+    // Force badge re-render after the initial awareness sync completes.
+    // The awareness 'change' event only fires for delta changes — if a remote
+    // client's state was already cached locally, no event fires on reconnect.
+    this.manifestProvider.on('sync', (isSynced: boolean) => {
+      if (isSynced) setTimeout(() => this.presence.forceRefresh(), 150);
+    });
+
+    const fileMap = this.manifestDoc.getMap<FileEntry>('files');
+    const onFileMapChange = (event: Y.YMapEvent<FileEntry>) => {
+      const renamedFromPaths = new Set<string>();
+      event.changes.keys.forEach((change, filePath) => {
+        if (change.action === 'add' || change.action === 'update') {
+          const val = fileMap.get(filePath);
+          if (val?.exists && val.renamedFrom) renamedFromPaths.add(val.renamedFrom);
+        }
+      });
+
       event.changes.keys.forEach(async (change, filePath) => {
         if (change.action === 'add' || change.action === 'update') {
           const val = fileMap.get(filePath);
-          if (val?.exists && !this.app.vault.getAbstractFileByPath(filePath)) {
+          if (!val?.exists) return;
+
+          // A remote peer says this file exists. If we have a pending local
+          // delete for the same path, cancel it — otherwise our 3s timer
+          // would fire and propagate a delete that wipes out the remote's
+          // restoration.
+          this.deleteDebouncer.cancel(filePath);
+
+          // Propagate last-edited metadata to status bar
+          if (val.lastEditedBy && val.lastEditedAt) {
+            this.presence.setFileMetadata(filePath, {
+              lastEditedBy: val.lastEditedBy,
+              lastEditedAt: val.lastEditedAt,
+            });
+          }
+
+          // Binary file — download from Supabase Storage
+          if (val.binary && val.storageKey) {
+            if (val.renamedFrom) {
+              const oldFile = this.app.vault.getAbstractFileByPath(val.renamedFrom);
+              this.remoteFileOps.add(filePath);
+              this.remoteFileOps.add(val.renamedFrom);
+              try {
+                if (oldFile instanceof TFile) {
+                  await this.app.fileManager.renameFile(oldFile, filePath);
+                } else if (!this.app.vault.getAbstractFileByPath(filePath)) {
+                  this.remoteFileOps.delete(filePath);
+                  this.remoteFileOps.delete(val.renamedFrom);
+                  await this.downloadBinaryFile(filePath, val.storageKey, true);
+                  return;
+                }
+              } catch { /* race */ }
+              this.remoteFileOps.delete(filePath);
+              this.remoteFileOps.delete(val.renamedFrom);
+            } else {
+              await this.downloadBinaryFile(filePath, val.storageKey, change.action === 'update');
+            }
+            return;
+          }
+
+          // Text file rename
+          if (val.renamedFrom) {
+            const oldFile = this.app.vault.getAbstractFileByPath(val.renamedFrom);
+            this.remoteFileOps.add(filePath);
+            this.remoteFileOps.add(val.renamedFrom);
+            try {
+              if (oldFile instanceof TFile) {
+                await this.app.fileManager.renameFile(oldFile, filePath);
+              } else if (!this.app.vault.getAbstractFileByPath(filePath)) {
+                await this.app.vault.create(filePath, '');
+              }
+            } catch { /* race */ }
+            this.remoteFileOps.delete(filePath);
+            this.remoteFileOps.delete(val.renamedFrom);
+            this.disconnectFile(val.renamedFrom);
+            await this.connectFile(filePath);
+          } else if (!this.app.vault.getAbstractFileByPath(filePath)) {
+            // Text file create
             this.remoteFileOps.add(filePath);
             try {
-              // Ensure parent folders exist
               const parts = filePath.split('/');
               if (parts.length > 1) {
                 const folder = parts.slice(0, -1).join('/');
-                if (!this.app.vault.getAbstractFileByPath(folder)) {
+                if (!this.app.vault.getAbstractFileByPath(folder))
                   await this.app.vault.createFolder(folder);
-                }
               }
               await this.app.vault.create(filePath, '');
-            } catch { /* file may already exist due to race */ }
+            } catch { /* already exists */ }
             this.remoteFileOps.delete(filePath);
             await this.connectFile(filePath);
           }
         } else if (change.action === 'delete') {
+          if (renamedFromPaths.has(filePath)) return;
           const file = this.app.vault.getAbstractFileByPath(filePath);
           if (file instanceof TFile) {
             this.remoteFileOps.add(filePath);
-            try { await this.app.vault.delete(file); } catch { /* already gone */ }
+            // OS trash (not vault.delete) — a delete reaching us from another
+            // peer may have been a cloud-sync transient on their end. Trash is
+            // recoverable; permanent delete is not.
+            try { await this.app.vault.trash(file, true); } catch { /* already gone */ }
             this.remoteFileOps.delete(filePath);
             this.disconnectFile(filePath);
           }
@@ -98,15 +310,17 @@ export class SyncManager {
     this.unsubscribers.push(() => fileMap.unobserve(onFileMapChange));
   }
 
-  // ── Per-file rooms ─────────────────────────────────────────────────────────
-  // ?room=<filePath> → relay docName = vaultId/<filePath>
+  // ── Per-file rooms (text + canvas) ────────────────────────────────────────
 
   async connectFile(filePath: string) {
     if (!this.settings || this.providers.has(filePath)) return;
+    if (isBinaryFile(filePath)) return;
     const { relayUrl, vaultId, userToken } = this.settings;
+    const isCanvas = isCanvasFile(filePath);
 
     const doc = new Y.Doc();
-    const yText = doc.getText('content');
+    const yText = doc.getText('content');       // text files
+    const yComments = doc.getMap<Y.Map<any>>('comments');
 
     const baseUrl = relayUrl.replace(/\/sync$/, '');
     const provider = new WebsocketProvider(baseUrl, `sync/${vaultId}/${filePath}`, doc, {
@@ -115,8 +329,13 @@ export class SyncManager {
 
     this.docs.set(filePath, doc);
     this.providers.set(filePath, provider);
+    this.commentsMaps.set(filePath, yComments);
+    this.onFileConnected?.(filePath, yComments);
 
-    // On first sync: seed from local file if doc is empty; otherwise apply remote
+    // On first-sync, decide who's the source of truth: if the Y.Doc came back
+    // empty, seed it from disk; if it came back with state that differs from
+    // disk, write the remote state to disk. Canvas uses structured Y.Maps
+    // (nodes + edges); text uses yText.
     provider.on('sync', async (isSynced: boolean) => {
       if (!isSynced) return;
       await new Promise(r => setTimeout(r, 800));
@@ -124,27 +343,40 @@ export class SyncManager {
       const file = this.app.vault.getAbstractFileByPath(filePath);
       if (!(file instanceof TFile)) return;
 
-      if (yText.toString() === '') {
+      if (isCanvas) {
+        const nodesEmpty = getCanvasNodes(doc).size === 0;
+        const edgesEmpty = getCanvasEdges(doc).size === 0;
         const localContent = await this.app.vault.read(file);
-        if (localContent) {
-          doc.transact(() => { yText.insert(0, localContent); }, LOCAL_ORIGIN);
+        if (nodesEmpty && edgesEmpty) {
+          if (localContent.trim()) applyCanvasFromDisk(doc, localContent);
+        } else {
+          const remoteContent = serializeCanvasToDisk(doc);
+          if (remoteContent !== localContent) {
+            await this.app.vault.modify(file, remoteContent);
+          }
         }
       } else {
-        // Remote doc has content — apply it to local file
-        const remoteContent = yText.toString();
-        const localContent = await this.app.vault.read(file);
-        if (remoteContent !== localContent) {
-          await this.app.vault.modify(file, remoteContent);
+        if (yText.toString() === '') {
+          const localContent = await this.app.vault.read(file);
+          if (localContent) {
+            doc.transact(() => { yText.insert(0, localContent); }, LOCAL_ORIGIN);
+          }
+        } else {
+          const remoteContent = yText.toString();
+          const localContent = await this.app.vault.read(file);
+          if (remoteContent !== localContent) {
+            await this.app.vault.modify(file, remoteContent);
+          }
         }
       }
     });
 
-    // Remote update → patch local file
+    // On remote updates (origin !== LOCAL_ORIGIN), reflect them to disk.
     doc.on('update', async (_update: Uint8Array, origin: unknown) => {
       if (origin === LOCAL_ORIGIN) return;
       const file = this.app.vault.getAbstractFileByPath(filePath);
       if (!(file instanceof TFile)) return;
-      const remoteContent = yText.toString();
+      const remoteContent = isCanvas ? serializeCanvasToDisk(doc) : yText.toString();
       const localContent = await this.app.vault.read(file);
       if (remoteContent !== localContent) {
         await this.app.vault.modify(file, remoteContent);
@@ -159,6 +391,107 @@ export class SyncManager {
     this.providers.delete(filePath);
     this.docs.get(filePath)?.destroy();
     this.docs.delete(filePath);
+    this.commentsMaps.delete(filePath);
+  }
+
+  // ── Binary file storage (Supabase) ─────────────────────────────────────────
+  /*
+   * Supabase setup required (run once in SQL editor):
+   *
+   *   insert into storage.buckets (id, name, public)
+   *   values ('vault-assets', 'vault-assets', false)
+   *   on conflict do nothing;
+   *
+   *   create policy "vault members read"  on storage.objects for select using (auth.role() = 'authenticated');
+   *   create policy "vault members write" on storage.objects for insert with check (auth.role() = 'authenticated');
+   *   create policy "vault members update" on storage.objects for update using (auth.role() = 'authenticated');
+   *   create policy "vault members delete" on storage.objects for delete using (auth.role() = 'authenticated');
+   */
+
+  private async uploadBinaryFile(file: TFile): Promise<void> {
+    if (!this.settings) return;
+    const storageKey = `${this.settings.vaultId}/${file.path}`;
+    try {
+      const buffer = await this.app.vault.readBinary(file);
+      // Direct fetch to the Storage REST API. Bypasses supabase-js's Storage
+      // client, which in our setup doesn't attach the session JWT to upload
+      // requests — Storage sees only the anon key, RLS then denies as
+      // "new row violates row-level security policy" even though the current
+      // session is a valid vault member. Verified 2026-07-29 that pure fetch
+      // with `Authorization: Bearer <access_token>` succeeds where the JS
+      // client fails.
+      const session = (await this.settings.supabase.auth.getSession()).data.session;
+      if (!session?.access_token) {
+        console.error('[FreeSync] Storage upload: no session'); return;
+      }
+      // URL-encode each path segment (Supabase Storage requires spaces etc.
+      // encoded — sending literal spaces trips a 400/403 depending on how
+      // the intermediate proxies interpret the URL).
+      const encodedPath = storageKey.split('/').map(encodeURIComponent).join('/');
+      // Upsert as a QUERY PARAM (`?upsert=true`), NOT the `x-upsert` header.
+      // The header form triggers an RLS-eval code path in Storage that always
+      // returns "new row violates row-level security policy" for us, even on
+      // a fresh insert where no existing row could conflict. Verified
+      // 2026-07-29: identical fetch with `?upsert=true` succeeds where
+      // `x-upsert: true` fails.
+      const url = `${this.settings.supabaseUrl}/storage/v1/object/${STORAGE_BUCKET}/${encodedPath}?upsert=true`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'apikey':        this.settings.supabaseAnonKey,
+          'Authorization': `Bearer ${session.access_token}`,
+          'Content-Type':  contentType(file.path),
+        },
+        body: new Uint8Array(buffer),
+      });
+      if (!res.ok) {
+        console.error('[FreeSync] Storage upload failed:', res.status, await res.text().catch(() => ''));
+        return;
+      }
+      this.recentlyUploaded.add(storageKey);
+      setTimeout(() => this.recentlyUploaded.delete(storageKey), 10_000);
+      const fileMap = this.manifestDoc?.getMap<FileEntry>('files');
+      const existing: FileEntry = fileMap?.get(file.path) ?? { exists: true };
+      this.manifestDoc?.transact(() => {
+        fileMap?.set(file.path, { ...existing, binary: true, storageKey, binaryVersion: Date.now() });
+      }, LOCAL_ORIGIN);
+    } catch (err) {
+      console.error('[FreeSync] Storage upload error:', err);
+    }
+  }
+
+  private async downloadBinaryFile(filePath: string, storageKey: string, forceDownload = false): Promise<void> {
+    if (!this.settings) return;
+    if (this.recentlyUploaded.has(storageKey)) return;
+    const existing = this.app.vault.getAbstractFileByPath(filePath);
+    if (!forceDownload && existing instanceof TFile && existing.stat.size > 0) return;
+    try {
+      const { data, error } = await this.settings.supabase.storage
+        .from(STORAGE_BUCKET)
+        .download(storageKey);
+      if (error || !data) { console.error('[FreeSync] Storage download failed:', error?.message); return; }
+      const buffer = await data.arrayBuffer();
+      this.remoteFileOps.add(filePath);
+      try {
+        if (existing instanceof TFile) {
+          await this.app.vault.modifyBinary(existing, buffer);
+        } else {
+          const parts = filePath.split('/');
+          if (parts.length > 1) {
+            const folder = parts.slice(0, -1).join('/');
+            if (!this.app.vault.getAbstractFileByPath(folder))
+              await this.app.vault.createFolder(folder);
+          }
+          await this.app.vault.createBinary(filePath, buffer);
+        }
+      } catch (e) {
+        console.error('[FreeSync] Vault binary write failed:', e);
+      }
+      this.remoteFileOps.delete(filePath);
+    } catch (err) {
+      console.error('[FreeSync] Storage download error:', err);
+      this.remoteFileOps.delete(filePath);
+    }
   }
 
   // ── Vault event watchers ───────────────────────────────────────────────────
@@ -166,29 +499,96 @@ export class SyncManager {
   private watchVault() {
     if (!this.settings) return;
 
-    // Local file modified → push minimal diff into Yjs
     const onModify = async (file: TAbstractFile) => {
       if (!(file instanceof TFile)) return;
+      if (this.remoteFileOps.has(file.path)) return;
+
+      // Binary: re-upload to storage
+      if (isBinaryFile(file.path)) {
+        await this.uploadBinaryFile(file);
+        return;
+      }
+
       const doc = this.docs.get(file.path);
       if (!doc) return;
-      const yText = doc.getText('content');
       const newContent = await this.app.vault.read(file);
-      const oldContent = yText.toString();
-      if (newContent === oldContent) return;
-      const { index, deleteCount, insertText } = minimalDiff(oldContent, newContent);
-      doc.transact(() => {
-        if (deleteCount > 0) yText.delete(index, deleteCount);
-        if (insertText) yText.insert(index, insertText);
-      }, LOCAL_ORIGIN);
+
+      if (isCanvasFile(file.path)) {
+        // Canvas: reconcile the JSON into structured Y.Maps. Skips silently
+        // if the on-disk JSON is unparseable (half-written by Obsidian).
+        const before = serializeCanvasToDisk(doc);
+        if (before === newContent) return;
+        applyCanvasFromDisk(doc, newContent);
+      } else {
+        // Text: Yjs minimal diff
+        const yText = doc.getText('content');
+        const oldContent = yText.toString();
+        if (newContent === oldContent) return;
+        const { index, deleteCount, insertText } = minimalDiff(oldContent, newContent);
+        doc.transact(() => {
+          if (deleteCount > 0) yText.delete(index, deleteCount);
+          if (insertText) yText.insert(index, insertText);
+        }, LOCAL_ORIGIN);
+      }
+
+      // Update manifest last-edited metadata
+      if (this.manifestDoc) {
+        const fileMap = this.manifestDoc.getMap<FileEntry>('files');
+        const existing: FileEntry = fileMap.get(file.path) ?? { exists: true };
+        this.manifestDoc.transact(() => {
+          fileMap.set(file.path, {
+            ...existing,
+            lastEditedBy: {
+              userId: this.settings!.userId,
+              display_name: this.settings!.displayName,
+              color: this.settings!.color,
+            },
+            lastEditedAt: Date.now(),
+          });
+        }, LOCAL_ORIGIN);
+      }
+
+      // History snapshot — at most once per 5 minutes
+      const yHistory = doc.getArray<any>('history');
+      const last = yHistory.length > 0 ? yHistory.get(yHistory.length - 1) : null;
+      if (!last || Date.now() - last.timestamp > 5 * 60 * 1000) {
+        const entry = {
+          userId: this.settings!.userId,
+          display_name: this.settings!.displayName,
+          color: this.settings!.color,
+          timestamp: Date.now(),
+          content: newContent,
+        };
+        doc.transact(() => {
+          if (yHistory.length >= 20) yHistory.delete(0, 1);
+          yHistory.push([entry]);
+        }, LOCAL_ORIGIN);
+      }
     };
     this.app.vault.on('modify', onModify);
     this.unsubscribers.push(() => this.app.vault.off('modify', onModify));
 
-    // Local file created → broadcast via manifest map + connect provider
     const onCreate = async (file: TAbstractFile) => {
       if (!(file instanceof TFile)) return;
-      if (this.remoteFileOps.has(file.path)) return; // skip remote-triggered creates
-      const fileMap = this.manifestDoc?.getMap<{ exists: boolean }>('files');
+
+      // Cancel any pending delete for this path BEFORE the remoteFileOps
+      // check. The file is back on disk — whether the OS re-created it
+      // (cloud-sync transient), a user restored it, or a remote peer's
+      // create is being applied. Either way, propagating a stale delete
+      // would orphan the file.
+      const hadPending = this.deleteDebouncer.cancel(file.path);
+
+      if (this.remoteFileOps.has(file.path)) return;
+      // Local cloud-sync re-create: manifest entry + per-file room are still
+      // intact (we never propagated the delete), so nothing else to do.
+      if (hadPending) return;
+
+      if (isBinaryFile(file.path)) {
+        await this.uploadBinaryFile(file);
+        return;
+      }
+
+      const fileMap = this.manifestDoc?.getMap<FileEntry>('files');
       this.manifestDoc?.transact(() => {
         fileMap?.set(file.path, { exists: true });
       }, LOCAL_ORIGIN);
@@ -197,39 +597,105 @@ export class SyncManager {
     this.app.vault.on('create', onCreate);
     this.unsubscribers.push(() => this.app.vault.off('create', onCreate));
 
-    // Local file deleted → remove from manifest map + disconnect
+    const onRename = async (file: TAbstractFile, oldPath: string) => {
+      if (!(file instanceof TFile)) return;
+      if (this.remoteFileOps.has(file.path) || this.remoteFileOps.has(oldPath)) return;
+      const activePath = this.app.workspace.getActiveFile()?.path;
+      if (activePath === file.path || activePath === oldPath)
+        this.presence.setActiveFile(file.path);
+
+      if (isBinaryFile(file.path) && this.settings) {
+        // Supabase Storage has no rename — copy to new key, delete old
+        const oldKey = `${this.settings.vaultId}/${oldPath}`;
+        const newKey = `${this.settings.vaultId}/${file.path}`;
+        try {
+          const { data } = await this.settings.supabase.storage.from(STORAGE_BUCKET).download(oldKey);
+          if (data) {
+            const buffer = await data.arrayBuffer();
+            await this.settings.supabase.storage.from(STORAGE_BUCKET)
+              .upload(newKey, buffer, { upsert: true, contentType: contentType(file.path) });
+            this.recentlyUploaded.add(newKey);
+            setTimeout(() => this.recentlyUploaded.delete(newKey), 10_000);
+            await this.settings.supabase.storage.from(STORAGE_BUCKET).remove([oldKey]);
+          }
+        } catch (err) {
+          console.error('[FreeSync] Storage rename failed:', err);
+        }
+        const fileMap = this.manifestDoc?.getMap<FileEntry>('files');
+        this.manifestDoc?.transact(() => {
+          fileMap?.delete(oldPath);
+          fileMap?.set(file.path, { exists: true, binary: true, storageKey: newKey, renamedFrom: oldPath, binaryVersion: Date.now() });
+        }, LOCAL_ORIGIN);
+        return;
+      }
+
+      const fileMap = this.manifestDoc?.getMap<FileEntry>('files');
+      this.manifestDoc?.transact(() => {
+        fileMap?.delete(oldPath);
+        fileMap?.set(file.path, { exists: true, renamedFrom: oldPath });
+      }, LOCAL_ORIGIN);
+      this.disconnectFile(oldPath);
+      await this.connectFile(file.path);
+    };
+    this.app.vault.on('rename', onRename);
+    this.unsubscribers.push(() => this.app.vault.off('rename', onRename));
+
     const onDelete = (file: TAbstractFile) => {
       if (!(file instanceof TFile)) return;
-      if (this.remoteFileOps.has(file.path)) return; // skip remote-triggered deletes
-      const fileMap = this.manifestDoc?.getMap<{ exists: boolean }>('files');
-      this.manifestDoc?.transact(() => {
-        fileMap?.delete(file.path);
-      }, LOCAL_ORIGIN);
-      this.disconnectFile(file.path);
+      if (this.remoteFileOps.has(file.path)) return;
+      // Debouncer holds the delete for DELETE_DEBOUNCE_MS, re-checks the
+      // file is still gone at fire time, then calls propagateDelete().
+      this.deleteDebouncer.schedule(file.path);
     };
     this.app.vault.on('delete', onDelete);
     this.unsubscribers.push(() => this.app.vault.off('delete', onDelete));
 
-    // Active file changed → update presence + connect provider lazily
+    let clearPresenceTimer: ReturnType<typeof setTimeout> | null = null;
     const onFileOpen = async (file: TFile | null) => {
-      this.presence.setActiveFile(file?.path ?? null);
-      if (file && !this.providers.has(file.path)) {
-        await this.connectFile(file.path);
+      if (file) {
+        if (clearPresenceTimer) { clearTimeout(clearPresenceTimer); clearPresenceTimer = null; }
+        this.presence.setActiveFile(file.path);
+        if (!this.providers.has(file.path) && !isBinaryFile(file.path)) {
+          await this.connectFile(file.path);
+        }
+      } else {
+        clearPresenceTimer = setTimeout(() => {
+          clearPresenceTimer = null;
+          this.presence.setActiveFile(null);
+        }, 300);
       }
     };
     this.app.workspace.on('file-open', onFileOpen);
-    this.unsubscribers.push(() => this.app.workspace.off('file-open', onFileOpen));
+    this.unsubscribers.push(() => {
+      if (clearPresenceTimer) clearTimeout(clearPresenceTimer);
+      this.app.workspace.off('file-open', onFileOpen);
+    });
+
+    // Canvas view navigation doesn't reliably fire 'file-open', so a user
+    // leaving a canvas leaves their presence badge stuck on it. Mirror any
+    // active-leaf-change into presence too — cheap, and the setActiveFile
+    // call is idempotent for repeat file paths.
+    const onLeafChange = () => {
+      const activeFile = this.app.workspace.getActiveFile();
+      this.presence.setActiveFile(activeFile?.path ?? null);
+    };
+    this.app.workspace.on('active-leaf-change', onLeafChange);
+    this.unsubscribers.push(() => this.app.workspace.off('active-leaf-change', onLeafChange));
   }
 
   stop() {
     for (const unsub of this.unsubscribers) unsub();
     this.unsubscribers = [];
+    this.deleteDebouncer.cancelAll();
+    if (this.reconcileTimer) { clearInterval(this.reconcileTimer); this.reconcileTimer = null; }
     this.manifestProvider?.destroy();
     this.manifestDoc?.destroy();
     for (const provider of this.providers.values()) provider.destroy();
     for (const doc of this.docs.values()) doc.destroy();
     this.providers.clear();
     this.docs.clear();
+    this.commentsMaps.clear();
+    this.recentlyUploaded.clear();
     this.presence.destroy();
   }
 }

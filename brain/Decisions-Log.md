@@ -1,5 +1,7 @@
 # Decisions Log
 
+> See also: [[Architecture]], [[Known-Issues]]
+
 Record every significant architectural or product decision here. Include: what was decided, why, and what alternatives were rejected. This prevents re-litigation.
 
 ---
@@ -34,17 +36,17 @@ Record every significant architectural or product decision here. Include: what w
 
 **Decision:** Backend and Plugin engineers work in parallel in Phase 1. Plugin engineer can start once relay exposes a health endpoint, even before auth is wired.
 
-**Why:** Decouples the plugin dev loop from Supabase complexity. Plugin can be tested locally against an unauthenticated relay first, then auth is layered in.
+**Why:** Decouples the plugin dev loop from Supabase complexity.
 
 ---
 
 ## 2026-05-05 — Manifest room for global presence
 
-**Decision:** All clients always connect to `${vaultId}/__manifest__` in addition to per-file rooms. Presence awareness lives here.
+**Decision:** All clients always connect to `sync/${vaultId}/__manifest__` in addition to per-file rooms. Presence awareness lives on the manifest room.
 
 **Why:** Without a shared room, users only see collaborators who have the exact same file open. The manifest room ensures all vault members are visible in the file explorer regardless of which file they're editing.
 
-**Implementation:** Y.Map on `__manifest__` tracks the file tree. Yjs awareness on `__manifest__` carries all connected users.
+**Implementation:** `Y.Map 'files'` on `__manifest__` tracks the file tree. Yjs awareness on `__manifest__` carries all connected users' state.
 
 ---
 
@@ -70,7 +72,7 @@ Record every significant architectural or product decision here. Include: what w
 
 **Decision:** Never delete-all + insert-all when syncing file changes. Always find common prefix/suffix and update only the changed region.
 
-**Why:** A delete-all + insert-all creates a single massive Yjs operation that, if another client is editing simultaneously, will be flagged as a conflict and may cause merges to produce garbage content. A minimal diff produces 1-character updates for single keystrokes, making merges clean.
+**Why:** A delete-all + insert-all creates a single massive Yjs operation that, under concurrent editing, causes conflict merges to produce garbage. A minimal diff produces 1-character updates for single keystrokes, making merges clean.
 
 ---
 
@@ -78,7 +80,7 @@ Record every significant architectural or product decision here. Include: what w
 
 **Decision:** No Dockerfile until Phase 1 sync POC is validated.
 
-**Why:** Premature containerization adds complexity to a phase where fast iteration is critical. The relay will run directly on the VPS via systemd in Phase 4. Docker image is a nice-to-have for self-hosters, not a Phase 1 requirement.
+**Why:** Premature containerization adds complexity during a phase where fast iteration is critical.
 
 ---
 
@@ -86,7 +88,7 @@ Record every significant architectural or product decision here. Include: what w
 
 **Decision:** Mobile plans cost $2–4/year more than web (Plus: $12 web / $14 mobile, Pro: $24 web / $28 mobile).
 
-**Why:** App store cut (Apple 30%, Google 15–30%) must be offset. The price delta also intentionally nudges users toward freesync.app web subscription, which is more profitable.
+**Why:** App store cut (Apple 30%, Google 15–30%) must be offset. The price delta also nudges users toward freesync.app web subscription, which is more profitable.
 
 ---
 
@@ -94,4 +96,175 @@ Record every significant architectural or product decision here. Include: what w
 
 **Decision:** AGPL-3.0 for all packages.
 
-**Why:** Allows self-hosting, requires modifications to be open-sourced, prevents commercial forks without contributing back. Self-hosters bypass tier limits via `DISABLE_TIER_LIMITS=true` env flag.
+**Why:** Allows self-hosting, requires modifications to be open-sourced, prevents commercial forks without contributing back.
+
+---
+
+## 2026-05-06 — persistSession: false to prevent Electron session bleed
+
+**Decision:** Create Supabase client with `{ auth: { persistSession: false, autoRefreshToken: true } }` and always call `signInWithPassword` on every `startSync()`.
+
+**Why:** All Obsidian vault windows run in the same Electron renderer and share the same `localStorage` origin. Without `persistSession: false`, one vault's Supabase session leaks into another vault window, causing User2's plugin to connect with User1's JWT. `persistSession: false` prevents writing to localStorage entirely.
+
+**Rejected:** Using `getSession()` first then signing in — `getSession()` still reads localStorage and returns the wrong user's session.
+
+**2026-07-29 amendment:** originally paired `autoRefreshToken: false` with `persistSession: false` on the theory that "any auth machinery could leak state." That was wrong: `autoRefreshToken` operates on the in-memory session only, so refresh doesn't reintroduce the localStorage bleed. Leaving it off caused a separate bug — after ~1h the plugin's JWT silently expired and every subsequent Supabase Storage upload got 401'd inside the client, surfacing to the user as `The database schema is invalid or incompatible` (503) or `new row violates row-level security policy` (403). Flipped `autoRefreshToken: true` on the primary plugin client (the throwaway settings-tab sign-in client stays `false` — its lifetime is one `signInWithPassword` call).
+
+---
+
+## 2026-05-06 — AwarenessRef mutable object pattern for CM6 extensions
+
+**Decision:** Pass a mutable `AwarenessRef = { awareness: Awareness | null, localClientId: number }` to CM6 extensions at registration time. Populate it after `startSync()` resolves.
+
+**Why:** `registerEditorExtension()` must be called in `onload()` before auth completes, but awareness isn't available until `startSync()`. Passing a ref object lets extensions be registered eagerly and become functional once the ref is populated — no re-registration needed.
+
+**Implementation detail:** The subscribe retry uses a separate `awarenessCleaner` variable (not `this.unsub`) as the "already connected" guard, avoiding a bug where setting `this.unsub` to the clearInterval wrapper caused `tryConnect()` to bail early after awareness became available.
+
+---
+
+## 2026-05-06 — fileManager.renameFile() not vault.rename() for remote renames
+
+**Decision:** Remote rename operations use `app.fileManager.renameFile(oldFile, newPath)` instead of `app.vault.rename()`.
+
+**Why:** `vault.rename()` is a low-level vault operation that doesn't update the Obsidian workspace. When the remote side renames a file the local user has open, `vault.rename()` causes the editor leaf to go blank. `fileManager.renameFile()` is the higher-level API that handles workspace leaf updates and internal link rewrites, keeping the editor open and seamlessly updating the title.
+
+---
+
+## 2026-05-06 — 300ms debounce on file-open null events for presence
+
+**Decision:** When `workspace.on('file-open')` fires with `null`, wait 300ms before calling `presence.setActiveFile(null)`. If a real file-open fires within that window, cancel the null update.
+
+**Why:** Obsidian emits `file-open null` briefly during internal transitions (rename, leaf update). Without debouncing, presence flashes to null then back, causing badge/cursor disruption visible to other users. 300ms is long enough to absorb the transition but short enough to feel immediate when a user genuinely closes all files.
+
+---
+
+## 2026-05-06 — Rename sync as atomic delete+add with renamedFrom marker
+
+**Decision:** Renames are broadcast as a single Yjs transaction: `fileMap.delete(oldPath)` + `fileMap.set(newPath, { exists: true, renamedFrom: oldPath })`. The observer does a two-pass read of all changes before acting.
+
+**Why:** A naive approach processes 'delete' before 'add' and deletes the file on the remote side before the rename context is available. The two-pass approach collects all `renamedFrom` paths first, then skips their 'delete' events, routing them through the rename branch instead.
+
+---
+
+## 2026-05-06 — Inline comments stored in per-file Yjs doc
+
+**Decision:** Comments live as a `Y.Map<Y.Map>` keyed by comment ID inside the per-file Yjs doc (not a separate room, not Supabase). Each comment's replies are a `Y.Array`. See [[Comments-Plan]].
+
+**Why:** Storing comments in the same Yjs doc as the file content means they sync through the same relay room with no extra infrastructure. Comments are CRDT-native: concurrent adds don't conflict, resolving a comment (last-write-wins boolean) is safe, and replies are an append-only list. The alternative (Supabase rows) would require REST calls and polling, breaking the real-time model.
+
+**Tradeoff accepted:** Character offsets (`from`, `to`) drift when text is inserted before the comment range. Relative positions (Yjs `RelativePosition`) would fix this but add significant complexity. Accepted for MVP.
+
+---
+
+## 2026-05-06 — Binary file sync via Supabase Storage
+
+**Decision:** Binary files (PNG, PDF, media) are uploaded to Supabase Storage bucket `vault-assets` and referenced in the manifest Y.Map as `{ binary: true, storageKey, binaryVersion }`. Text files sync via Yjs as before.
+
+**Why:** Yjs Y.Text is not suitable for binary data. Supabase Storage gives us a CDN-backed object store that's already part of the stack. The manifest Y.Map entry acts as an event bus — when `binaryVersion` changes, receivers download the new blob. Version field prevents re-downloading unchanged binaries.
+
+**Rejected alternatives:**
+- Relay WebSocket binary frames: Adds complexity to the relay, memory pressure for large files
+- Base64 in Y.Text: Bloats Yjs doc, breaks CRDT efficiency
+
+---
+
+## 2026-05-13 — Railway for relay hosting (over Hetzner / Fly.io)
+
+**Decision:** Deploy the relay server to Railway rather than a VPS (Hetzner) or Fly.io.
+
+**Why:** Railway auto-deploys from the `agent/plugin-phase1` git branch, handles TLS termination (plugin must use `wss://`), and costs ~$5/month flat on Hobby plan — predictable at personal scale. Hetzner would require manual Docker ops. Fly.io has similar DX but less mature WebSocket support.
+
+**Live URL:** `wss://freesync-production.up.railway.app`
+
+**Rejected alternatives:**
+- Hetzner VPS: Cheaper at scale but requires manual Docker/Caddy ops at setup time
+- Fly.io: Similar DX but no clear cost advantage and less Railway ecosystem familiarity
+
+---
+
+## 2026-05-13 — Node 22 required in Docker image
+
+**Decision:** Relay Dockerfile uses `FROM node:22-alpine`, not `node:20-alpine`.
+
+**Why:** `@supabase/realtime-js` uses the global `WebSocket` constructor directly. Node 20 does not include native WebSocket support (it was experimental). Node 22 ships native WebSocket as a stable built-in. The server throws `Error: Node.js detected without native WebSocket support` at startup on Node 20.
+
+---
+
+## 2026-05-13 — Multi-device presence by design (no deduplication)
+
+**Decision:** No user-ID-based deduplication in awareness. The same user on two devices appears as two separate presence indicators.
+
+**Why:** Yjs awareness assigns a random `clientID` per WebSocket connection, not per user. This is intentional — each connection represents an independent editing context. If a user edits file A on a laptop and file B on a phone, both presence states are correct and useful. Deduplication would hide real state.
+
+**Never add:** User-ID-based awareness deduplication. It would break legitimate multi-device workflows and is not how Yjs awareness is designed.
+
+---
+
+## 2026-05-13 — Cursor presence protection in CLAUDE.md
+
+**Decision:** Added a "Cursor Presence — Do Not Break" section to CLAUDE.md with an explicit pre-commit checklist.
+
+**Why:** The `box-shadow: inset 3px 0 0 <color>` color bar in `presence.ts renderFileBadge()` and the matching `boxShadow = ''` reset in `clearBadges()` were accidentally removed during comments panel work — for the second time. The CM6 `awarenessCleaner` guard pattern was also previously broken. These bugs are subtle (the badge renders without the color bar; the guard prevents retry on late awareness connect). Explicit CLAUDE.md invariants are the only reliable prevention.
+
+**Hard invariants documented:**
+1. `renderFileBadge()` must set `inner.style.boxShadow = 'inset 3px 0 0 <color>'`
+2. `clearBadges()` must reset `inner.style.boxShadow = ''`
+3. `cursors.ts` subscribe guard: use `awarenessCleaner` variable, not `this.unsub`
+4. `awarenessRef` wired in `startSync()` after `syncManager.start()`, cleared in `stopSync()`
+5. Never call `getBoundingClientRect()` inside CM6 `update()` — forces synchronous reflow
+
+---
+
+## 2026-07-22 — Relay must load persisted state on doc creation (bindState)
+
+**Decision:** The relay's y-websocket persistence layer uses `setPersistence({ bindState, writeState })` from `y-websocket/bin/utils`. `bindState` reads the corresponding `vault_docs` row and applies it to the fresh `Y.Doc` before the client's sync handshake completes.
+
+**Why:** The prior implementation was write-only — every update was persisted, but nothing was ever loaded back. When the relay restarted (Railway redeploy) with no clients connected, the next client to join got an empty `Y.Doc`. That empty CRDT state then merged into other peers, surfacing as missing files or reverted content. This directly caused real user data loss (school files) in July 2026.
+
+**Never remove `bindState`.** The persistence path is: `bindState` loads on doc creation → live updates trigger debounced `persistNow` → `writeState` flushes on last-client disconnect. Removing any layer reintroduces the loss.
+
+**Related mechanics that are also load-bearing:**
+- `decodeYjsState()` handles three historical BYTEA shapes (hex string, Buffer, Buffer-JSON-wrapped). Old rows use JSON-wrapped bytes because supabase-js encoded `Buffer` as JSON on write. New writes use raw bytes.
+- Handlers (`ydoc.on('update')`, `files.observe()`) must be attached BEFORE any `await` in `bindState` — y-websocket does not await the load, and updates arriving during the async gap are silently dropped otherwise. See [[Known-Issues]] entry on this.
+
+---
+
+## 2026-07-22 — Receiver-side deletes use `vault.trash`, never `vault.delete`
+
+**Decision:** The plugin's manifest observer, on a remote delete, calls `this.app.vault.trash(file, true)` — Obsidian's OS-trash path. Never `vault.delete()` (permanent unlink).
+
+**Why:** A single spurious delete arriving from a peer is unrecoverable if it hits `unlink()`. Any bug — in the cascade observer, in the delete debouncer, in a cloud-sync integration — that causes a phantom delete would destroy user files across every device it propagates to. Trash is the last-resort safety net that stays functional even when every other defense fails. Recoverable from Windows Recycle Bin / macOS Trash.
+
+**Never revert.** This is a one-line change that costs nothing in the happy path and protects everything.
+
+---
+
+## 2026-07-22 — Local deletes are debounced 3s to survive cloud-sync transients
+
+**Decision:** `packages/plugin/src/delete-debounce.ts` holds local `delete` events for 3s before propagating. `onCreate` for the same path cancels the pending delete; the manifest observer also cancels when a remote peer broadcasts the file still exists; a fire-time `fileExists()` re-check aborts propagation if the file is somehow back on disk.
+
+**Why:** OneDrive, Dropbox, and iCloud routinely remove a file from disk for a fraction of a second mid-sync. Obsidian's file watcher reports that as `delete`. Propagating immediately caused peers to permanently lose files that would have reappeared ~1s later. Root cause of at least one confirmed data-loss incident.
+
+**Rejected alternatives:**
+- No debounce, filter on file size / mtime: unreliable across sync engines.
+- Ignore `delete` events entirely, require explicit user confirmation: breaks legitimate deletions.
+- Longer debounce (10s+): makes real deletions feel laggy for collaborators.
+
+Test coverage in `packages/plugin/src/delete-debounce.test.ts` (12 cases, `npx tsx --test`).
+
+---
+
+## 2026-07-22 — Ghost-restoration prevention via manifest-cascade + defensive bindState
+
+**Decision:** The relay's manifest `bindState` attaches a `files.observe()` cascade that destroys the in-memory per-file `Y.Doc` and deletes the `vault_docs` row on real deletes. Per-file `bindState` also consults `manifestHasFile()` and skips loading state for paths not in the manifest.
+
+**Why:** Deletes propagated only via the manifest map; per-file `vault_docs` rows were orphaned. A later create with the same path (e.g. two consecutive "Untitled.md") re-loaded the orphan into the new `Y.Doc`, making the file look "haunted" by the old content. The cascade handles new deletes at the source; the defensive `bindState` catches orphans from before the fix or from any future bug.
+
+**Load-bearing supporting mechanics:**
+- `BIND_STATE_ORIGIN` symbol on the late-arriving `applyUpdate` — the cascade observer and update handler ignore this origin so CRDT reconciliation tombstones don't fire phantom cascades or persist loops.
+- `purgedDocs` set marked synchronously in `purgePersistedDoc()` before any await — prevents a near-simultaneous `writeState` from resurrecting a just-deleted row.
+- Rename detection mirrors the plugin's pattern: two-pass over `event.changes.keys`, collect `renamedFrom` from adds/updates in the same batch, skip cascade for those paths.
+
+**Not implemented (deliberately):** the defensive `bindState` does NOT opportunistically clean orphan rows. A fire-and-forget DELETE races with the next scheduled UPSERT and can wipe fresh content. Orphans are harmless (never loaded); a one-time GC script can handle table bloat if it matters.
+
+**Also deferred:** preserving deleted content as recoverable history. Discussed and out of scope for the fix.
