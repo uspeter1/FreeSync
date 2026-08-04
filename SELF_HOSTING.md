@@ -41,7 +41,7 @@ The web dashboard is optional. It's convenient for inviting collaborators and br
 ## What you'll need
 
 - A machine that can stay on — Raspberry Pi 3B+ or newer, an always-on desktop, a cheap VPS (Hetzner CX22 = €3.79/mo, Vultr $2.50/mo instance), etc. **~100 MB RAM per relay is plenty** for personal use.
-- **Node.js 22+** on that machine
+- **Node.js 20+** on that machine (root `package.json` enforces `engines.node: ">=20"`)
 - A **Supabase account** (free tier is fine — 500 MB database, 1 GB storage)
 - A **Cloudflare account** (free — for the tunnel, so you get a stable HTTPS URL without touching your router)
 - A domain name (**optional but recommended**, $8–15/yr from Namecheap/Porkbun/etc — makes the URL look like `freesync.yourdomain.com` instead of `<random-id>.cfargotunnel.com`)
@@ -296,12 +296,12 @@ The relay is a Node.js process that terminates WebSocket connections from client
 
 **On Debian/Ubuntu/Raspberry Pi OS:**
 ```bash
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo bash -
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
 sudo apt install -y nodejs git
-node --version   # should be v22+
+node --version   # should be v20+
 ```
 
-**On any other Linux distro** — install Node 22 however you normally would (nvm, `apk add nodejs npm`, etc).
+**On any other Linux distro** — install Node 20 (or newer) however you normally would (nvm, `apk add nodejs npm`, etc).
 
 > **Raspberry Pi note:** Pi 3 and up work fine (arm64). Older Pis (armv6, e.g. Pi Zero W) — the relay will *technically* run but the Node ecosystem's arm64 assumption keeps getting harder to escape. Recommend Pi 3B+ / 4 / 5 / Zero 2W.
 
