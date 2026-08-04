@@ -1,8 +1,10 @@
 # Contributing
 
-FreeSync is pre-release with a single active maintainer. **Outside pull requests are not being merged right now** — the API surface, schema, and file layouts still shift week to week, and a merged PR against the wrong invariant is expensive to unwind (some past regressions in this repo caused real data loss; see [`brain/Known-Issues.md`](brain/Known-Issues.md)).
+Pull requests are welcome — anyone can open one, I'll review and merge. Bug reports, feature ideas, docs fixes, tests, and refactors are all fair game.
 
-What is genuinely helpful right now:
+## Working locally
+
+The [README](README.md#local-development) has the exact setup for the four packages (relay, web dashboard, plugin, mobile scaffold). [SELF_HOSTING.md](SELF_HOSTING.md) covers a permanent self-hosted setup end-to-end if you'd rather test against your own stack.
 
 ## Bug reports
 
@@ -15,20 +17,20 @@ Open an issue with the [bug template](.github/ISSUE_TEMPLATE/bug.md). A useful r
 - **Environment** — Obsidian version, OS, whether you self-hosted or ran locally
 - **Console errors** — Obsidian dev tools (Ctrl/Cmd+Shift+I) for the plugin, `journalctl -u freesync-relay` for the server
 
-Reproductions matter more than diagnosis. A short paste that reliably breaks something is more useful than a guess at the cause.
-
-## Security issues
-
-Do **not** open a public issue. See [SECURITY.md](SECURITY.md).
+A short, reliable reproduction beats a long guess at the cause.
 
 ## Feature requests
 
 Open an issue with the [feature template](.github/ISSUE_TEMPLATE/feature.md). Frame the request as a user story rather than a proposed implementation — the implementation shape often has to change once it hits the invariants in [`brain/Decisions-Log.md`](brain/Decisions-Log.md).
 
-## Working locally
+## Pull requests
 
-If you want to hack on your own fork, the [README](README.md#local-development) has a `Local development` section with the exact commands, and [SELF_HOSTING.md](SELF_HOSTING.md) covers a permanent setup end-to-end.
+- Branch off `main`. Fork if you're an outside contributor.
+- Small, focused PRs merge fastest. One concern per PR keeps review sane.
+- Include a short test plan in the PR description — the exact steps someone should take to verify the change works.
+- If you're touching sync, presence, storage, or persistence, skim [`brain/Decisions-Log.md`](brain/Decisions-Log.md) and [`brain/Known-Issues.md`](brain/Known-Issues.md) first. Several past regressions caused real data loss; the fixes there are load-bearing.
+- Expect review turnaround within a few days. Ping the PR if it's been longer than a week.
 
-## When will outside contributions open?
+## Questions
 
-Realistically, once the API and schema stabilize enough that a merged PR isn't a debugging tax on the maintainer. No firm date. `brain/Phase-Status.md` tracks the shape of the near-term work.
+Open a discussion or an issue — whichever fits. There's no chat channel yet.
