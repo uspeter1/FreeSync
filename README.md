@@ -38,67 +38,41 @@ Real-time collaborative editing for [Obsidian](https://obsidian.md/) — "Google
 
 The plugin and web app each hold local Yjs docs; the relay merges updates from all connected clients and persists them so users can rejoin later. Supabase provides auth (JWT), the `vault_docs` / `vaults` / `vault_members` / `pending_invites` tables, and (in production) email delivery for invites.
 
-## Getting started (self-host / development)
+## Self-hosting
 
-You'll need Node 22+, a Supabase project (free tier is fine), and Obsidian installed locally.
+**For a permanent personal setup** — Raspberry Pi, home server, cheap VPS, etc — see [**SELF_HOSTING.md**](SELF_HOSTING.md). It walks through Supabase schema + RLS + storage setup, running the relay as a systemd service, exposing it via Cloudflare Tunnel (free, no port-forwarding, no cert renewal), and building the plugin. Full cost floor is $0/mo on Supabase's free tier + your own hardware.
 
-### 1. Supabase
+## Local development
 
-Create a project at [supabase.com](https://supabase.com/). Grab from **Project Settings → API**:
-- Project URL (`https://<project-ref>.supabase.co`)
-- `anon` public key
-- `service_role` key (never ship this to a client)
-
-Schema migrations live in the `brain/` design docs; a proper `supabase/migrations/` folder is on the roadmap. For now:
-- `profiles`, `vaults`, `vault_members`, `vault_docs` are created as described in `brain/Architecture.md`.
-- The `open_invite` column and `pending_invites` table with its `on_invite_confirmed` trigger are documented in `brain/Known-Issues.md`.
-
-### 2. Relay (`packages/server`)
+You'll need Node 22+, a Supabase project (free tier is fine — see [SELF_HOSTING.md § Part 1](SELF_HOSTING.md#part-1--set-up-supabase) for the schema), and Obsidian.
 
 ```bash
+# Relay (:3001)
 cp packages/server/.env.example packages/server/.env
-# Edit .env — set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and ALLOWED_ORIGINS
-# (comma-separated list of web origins, e.g. http://localhost:3002)
-
+# Edit .env — SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, ALLOWED_ORIGINS
 npm install
 npm run dev --workspace=packages/server
-```
 
-Relay listens on `:3001` by default. Health check at `http://localhost:3001/health`.
-
-### 3. Web dashboard (`packages/web`)
-
-```bash
+# Web dashboard (:3002)  — in another shell
 cp packages/web/.env.example packages/web/.env.local
-# Edit — set NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY,
-# and NEXT_PUBLIC_RELAY_URL (defaults to http://localhost:3001)
-
+# Edit — NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY, NEXT_PUBLIC_RELAY_URL
 npm run dev --workspace=packages/web
-```
 
-Open [http://localhost:3002](http://localhost:3002). Sign up, then land on `/dashboard`.
-
-### 4. Obsidian plugin (`packages/plugin`)
-
-```bash
-# Build once, or use --watch during development
+# Plugin — build once, or with --watch during active dev
+cp packages/plugin/.env.example packages/plugin/.env
+# Optionally set RELAY_URL / WEB_APP_URL to bake into the bundle
 npm run build --workspace=packages/plugin
 ```
 
-`main.js`, `manifest.json`, and `styles.css` land next to the config. Drop them into `<your-vault>/.obsidian/plugins/freesync/` and enable the plugin from Obsidian's Community plugins panel.
+`main.js`, `manifest.json`, and `styles.css` land in `packages/plugin/`. Drop them into `<your-vault>/.obsidian/plugins/freesync/` and enable in Obsidian.
 
-For a smoother dev loop, set `FREESYNC_DEV_VAULTS` to a colon-separated list of plugin dirs and the build will copy into all of them:
+For a smoother multi-vault dev loop, set `FREESYNC_DEV_VAULTS` (colon-separated plugin dirs) and the build copies to all of them:
 
 ```bash
 export FREESYNC_DEV_VAULTS=/path/to/vault1/.obsidian/plugins/freesync:/path/to/vault2/.obsidian/plugins/freesync
 ```
 
-The plugin's Advanced settings panel exposes overrides for Supabase URL, anon key, relay URL, and the web-app URL used for sign-up / dashboard links. The web-app URL can also be baked in at build time:
-
-```bash
-WEB_APP_URL=https://your-web-domain.example \
-  npm run build --workspace=packages/plugin
-```
+The plugin's **Advanced** settings panel exposes runtime overrides for Supabase URL, anon key, relay URL, and web-app URL — handy for switching a running plugin to a different backend without rebuilding.
 
 ## Design decisions and known issues
 

@@ -123,7 +123,7 @@ packages/server/src/
 
 ## Critical Bugs Fixed (Phase 1b) — see [[Decisions-Log]]
 
-- **Electron localStorage sharing** — all Obsidian vault windows share the same origin, causing Supabase session bleed. Fixed: `persistSession: false, autoRefreshToken: false`; always `signInWithPassword`.
+- **Electron localStorage sharing** — all Obsidian vault windows share the same origin, causing Supabase session bleed. Fixed: `persistSession: false`; always `signInWithPassword`. (`autoRefreshToken` was also flipped off originally but that turned out to be unnecessary — see 2026-07-29 note in [[Known-Issues]] — and re-enabling it fixed silent Storage 401s after ~1h.)
 - **AwarenessRef subscription race** — CM6 ViewPlugin constructor runs before `startSync()`. The interval retry used `this.unsub` as a "connected" check, but `this.unsub` was set to the clearInterval wrapper before awareness connected, so `tryConnect()` always bailed early. Fixed: separate `awarenessCleaner` variable.
 - **file-open null during rename** — Obsidian emits `file-open null` briefly when a leaf transitions during rename, clearing presence. Fixed: 300ms debounce on null events in `onFileOpen`.
 - **Rename vs delete confusion** — manifest map observer saw 'delete' for old path before 'add' for new path, deleting the file. Fixed: two-pass processing: first pass collects `renamedFrom` paths, second pass skips their deletes.

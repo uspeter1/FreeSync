@@ -102,11 +102,13 @@ Record every significant architectural or product decision here. Include: what w
 
 ## 2026-05-06 — persistSession: false to prevent Electron session bleed
 
-**Decision:** Create Supabase client with `{ auth: { persistSession: false, autoRefreshToken: false } }` and always call `signInWithPassword` on every `startSync()`.
+**Decision:** Create Supabase client with `{ auth: { persistSession: false, autoRefreshToken: true } }` and always call `signInWithPassword` on every `startSync()`.
 
 **Why:** All Obsidian vault windows run in the same Electron renderer and share the same `localStorage` origin. Without `persistSession: false`, one vault's Supabase session leaks into another vault window, causing User2's plugin to connect with User1's JWT. `persistSession: false` prevents writing to localStorage entirely.
 
 **Rejected:** Using `getSession()` first then signing in — `getSession()` still reads localStorage and returns the wrong user's session.
+
+**2026-07-29 amendment:** originally paired `autoRefreshToken: false` with `persistSession: false` on the theory that "any auth machinery could leak state." That was wrong: `autoRefreshToken` operates on the in-memory session only, so refresh doesn't reintroduce the localStorage bleed. Leaving it off caused a separate bug — after ~1h the plugin's JWT silently expired and every subsequent Supabase Storage upload got 401'd inside the client, surfacing to the user as `The database schema is invalid or incompatible` (503) or `new row violates row-level security policy` (403). Flipped `autoRefreshToken: true` on the primary plugin client (the throwaway settings-tab sign-in client stays `false` — its lifetime is one `signInWithPassword` call).
 
 ---
 

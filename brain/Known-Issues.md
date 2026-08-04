@@ -12,7 +12,8 @@ Status values: `[OPEN]` `[IN PROGRESS]` `[FIXED]` `[DEFERRED]` `[WONTFIX]`
 
 ## Phase 1b — Plugin
 
-- `[FIXED]` **Electron session bleed** — User2's plugin connected with User1's JWT because all vault windows share `localStorage` origin. Fixed 2026-05-06: `persistSession: false, autoRefreshToken: false`; always `signInWithPassword`. See [[Decisions-Log]].
+- `[FIXED]` **Electron session bleed** — User2's plugin connected with User1's JWT because all vault windows share `localStorage` origin. Fixed 2026-05-06: `persistSession: false`; always `signInWithPassword`. See [[Decisions-Log]].
+  - **2026-07-29 correction:** the original fix also disabled `autoRefreshToken` "for safety", but that turned out to be the *cause* of a separate silent failure: after ~1h the plugin's JWT expired and every subsequent Supabase Storage upload got 401'd inside the client, surfacing as either `The database schema is invalid or incompatible` (503) or `new row violates row-level security policy` (403) depending on the RLS state. Root cause is JWT expiry with no refresh, not RLS. Flipped `autoRefreshToken: true` (only touches in-memory session — session bleed protection is `persistSession: false`).
 
 - `[FIXED]` **AwarenessRef subscribe race** — CM6 cursor extension's interval retry used `this.unsub` as "already connected" guard, but `this.unsub` was set to clearInterval wrapper before awareness connected, causing `tryConnect()` to bail early. Remote cursors never updated. Fixed 2026-05-06: separate `awarenessCleaner` variable.
 

@@ -79,7 +79,7 @@ None.
 1. Room path: `sync/${vaultId}/${filePath}` — plugin settings `relayUrl` is `wss://freesync-production.up.railway.app` for live; `ws://localhost:3001` for dev
 2. Manifest room always connected: `sync/${vaultId}/__manifest__`
 3. `LOCAL_ORIGIN = 'local'` tag on all local Yjs mutations — remote handlers skip it
-4. Supabase `persistSession: false, autoRefreshToken: false` — Electron vaults share localStorage origin; always `signInWithPassword` on connect, never `getSession()`
+4. Supabase `persistSession: false` — Electron vaults share localStorage origin; always `signInWithPassword` on connect, never `getSession()`. `autoRefreshToken: true` (required — without refresh, JWT expires after ~1h and Storage uploads silently 401; refresh is in-memory so doesn't reintroduce session bleed)
 5. `fileManager.renameFile()` not `vault.rename()` — keeps workspace leaves open during rename
 6. `box-shadow: inset 3px 0 0 <color>` not `border-left` for nav highlights — see CLAUDE.md "Cursor Presence — Do Not Break"
 7. `clearBadges()` must reset `inner.style.boxShadow = ''` — see CLAUDE.md checklist

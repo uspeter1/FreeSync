@@ -112,11 +112,11 @@ GET /vaults/:vaultId/members
 
 Clients use the Supabase JS client with anon key + user JWT. RLS enforces access.
 
-**Critical:** always create client with `persistSession: false, autoRefreshToken: false` to prevent session bleed across Electron vault windows. See [[Known-Issues]] and [[Decisions-Log]].
+**Critical:** always create client with `persistSession: false` to prevent session bleed across Electron vault windows. `autoRefreshToken: true` is safe (and required — see below) because refresh only touches the in-memory session, not localStorage. See [[Known-Issues]] and [[Decisions-Log]].
 
 ```typescript
 const supabase = createClient(url, anonKey, {
-  auth: { persistSession: false, autoRefreshToken: false },
+  auth: { persistSession: false, autoRefreshToken: true },
 });
 
 // Auth — always sign in fresh, never use getSession()
