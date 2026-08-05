@@ -60,16 +60,20 @@ Swapping in raw Postgres alone (without the Supabase auth/storage services on to
 
 ---
 
-# Install the plugin (via BRAT)
+# Install the plugin
 
-FreeSync isn't in Obsidian's community plugin directory yet, so installs go through [**Obsidian42 – BRAT**](https://github.com/TfTHacker/obsidian42-brat) — a small "install and auto-update from a GitHub repo" plugin that's itself in the community directory.
+FreeSync isn't in Obsidian's community plugin directory yet, so installs currently go from the [GitHub releases page](https://github.com/uspeter1/freesync/releases).
+
+**Suggested — [Obsidian42 – BRAT](https://github.com/TfTHacker/obsidian42-brat)**, a community plugin that installs from a GitHub repo and auto-updates whenever you publish a new release:
 
 1. In Obsidian: **Settings → Community plugins → Browse → search "BRAT"** → install and enable.
 2. **BRAT → Add beta plugin** → paste `uspeter1/freesync` → **Add plugin**.
 3. **Community plugins → FreeSync → enable.**
 4. **FreeSync → Advanced → Relay URL** → paste `wss://<your-relay>/sync`.
 
-You still need a relay to point at. There's no public one yet — everyone runs their own via [Self-hosting](#self-hosting) below. BRAT will auto-check for updates whenever the manifest version bumps.
+**Or install manually** — download `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/uspeter1/freesync/releases/latest) and drop them into `<your-vault>/.obsidian/plugins/freesync/`. Enable in Community plugins. Updates are on you.
+
+Either way, you'll need a relay to point at. There's no public one yet — everyone runs their own via [Self-hosting](#self-hosting) below.
 
 ---
 
