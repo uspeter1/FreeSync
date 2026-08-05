@@ -60,6 +60,19 @@ Swapping in raw Postgres alone (without the Supabase auth/storage services on to
 
 ---
 
+# Install the plugin (via BRAT)
+
+FreeSync isn't in Obsidian's community plugin directory yet, so installs go through [**Obsidian42 – BRAT**](https://github.com/TfTHacker/obsidian42-brat) — a small "install and auto-update from a GitHub repo" plugin that's itself in the community directory.
+
+1. In Obsidian: **Settings → Community plugins → Browse → search "BRAT"** → install and enable.
+2. **BRAT → Add beta plugin** → paste `uspeter1/freesync` → **Add plugin**.
+3. **Community plugins → FreeSync → enable.**
+4. **FreeSync → Advanced → Relay URL** → paste `wss://<your-relay>/sync`.
+
+You still need a relay to point at. There's no public one yet — everyone runs their own via [Self-hosting](#self-hosting) below. BRAT will auto-check for updates whenever the manifest version bumps.
+
+---
+
 # Self-hosting
 
 End-to-end setup for running your own FreeSync instance permanently. Works on any Linux host: a home server, Raspberry Pi, cheap VPS, or a spare laptop that stays on. Cost floor is **$0** (Supabase free tier + your own hardware + Cloudflare Tunnel) up to **~$5/mo** if you rent a VPS.
