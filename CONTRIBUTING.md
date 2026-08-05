@@ -4,7 +4,7 @@ Pull requests are welcome — anyone can open one, I'll review and merge. Bug re
 
 ## Working locally
 
-The [README](README.md#local-development) has the exact setup for the four packages (relay, web dashboard, plugin, mobile scaffold). [SELF_HOSTING.md](SELF_HOSTING.md) covers a permanent self-hosted setup end-to-end if you'd rather test against your own stack.
+The [README](README.md#local-development) has the exact setup for the four packages (relay, web dashboard, plugin, mobile scaffold). The [self-hosting section of the README](README.md#self-hosting) covers a permanent setup end-to-end if you'd rather test against your own stack.
 
 ## Bug reports
 
